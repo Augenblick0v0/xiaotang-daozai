@@ -143,3 +143,29 @@ fn qq_old_message_banners_never_rebind_to_a_new_window(){
     assert!(h.app.alerts.iter().chain(h.app.notice.iter()).all(|alert|alert.body!="旧窗口消息"),"QQ 旧消息横幅不能指向后来的新窗口");
     assert!(h.app.alerts.iter().chain(h.app.notice.iter()).any(|alert|alert.body=="新窗口消息" && alert.unread==Some(new)));
 }
+
+#[test]
+fn unidentified_qq_reminder_becomes_clearable_once_its_account_is_bound(){
+    let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    h.app.settings.read_notifications=true;
+    h.app.receive_notification_from("QQ".into(),"QQ".into(),"群消息".into(),None);
+    let unknown=Unread::of(Messenger::Qq);
+    assert_eq!(h.app.pending_messengers,[unknown]);
+    let bound=Unread{source:Messenger::Qq,pid:13700,window:69046};
+    assert!(h.app.rebind_messenger_unread(unknown,bound),"点开时补绑到具体账号");
+    assert_eq!(h.app.pending_messengers,[bound],"改绑后岛上看的是同一个账号的同一条提醒");
+    assert!(h.app.alerts.iter().chain(h.app.notice.iter()).all(|alert|alert.unread!=Some(unknown)),"挂着的横幅也要跟着改绑，别指向已不存在的提醒");
+    h.app.viewed_client(Messenger::Qq,13700);
+    assert!(h.app.pending_messengers.is_empty(),"改绑后前台确认能收掉它；pid 0 的提醒自己永远清不掉");
+}
+
+#[test]
+fn bound_qq_reminder_absorbs_later_unidentified_toasts(){
+    let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    h.app.settings.read_notifications=true;
+    let bound=Unread{source:Messenger::Qq,pid:13700,window:69046};
+    h.app.receive_notification_from("QQ".into(),"QQ".into(),"第一条".into(),Some(bound));
+    h.app.receive_notification_from("QQ".into(),"QQ".into(),"第二条".into(),None);
+    assert_eq!(h.app.pending_messengers,[bound],"已绑账号的提醒不能再被一条账号不明的同源提醒重复计数");
+}
+

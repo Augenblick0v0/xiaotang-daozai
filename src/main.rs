@@ -486,7 +486,14 @@ impl eframe::App for Shell {
             if let Some((unread,rx))=&self.tray_opening {
                 let unread=*unread;
                 match rx.try_recv(){
-                    Ok(Ok(()))=>{self.tray_opening=None;self.opening_messenger=Some((unread,Instant::now()));ctx.request_repaint_after(Duration::from_secs(4));}
+                    Ok(Ok(()))=>{
+                        self.tray_opening=None;
+                        // 打开成功那一刻窗口通常已经切到前台：就地确认收掉提醒，不必再干等 4 秒。
+                        match self.messengers.foreground(&[unread.source]).filter(|(source,pid)|*source==unread.source && (unread.pid==0 || *pid==unread.pid)){
+                            Some((source,pid))=>{self.messengers.viewed_client(source,pid);self.app.viewed_client(source,pid);}
+                            None=>{self.opening_messenger=Some((unread,Instant::now()));ctx.request_repaint_after(Duration::from_secs(4));}
+                        }
+                    }
                     Ok(Err(error))=>{
                         self.tray_opening=None;
                         if error==OpenError::Exited{self.app.discard_unread(unread);}
@@ -503,8 +510,14 @@ impl eframe::App for Shell {
                 if !self.app.pending_messengers.contains(&unread){self.opening_messenger=None;}
                 else if started.elapsed()>=Duration::from_secs(4){
                     self.opening_messenger=None;
-                    // 未识别提醒是点开那一刻才补绑账号的：先把当前唯一在线账号记进账本，前台确认才认得它。
-                    if unread.pid==0{self.messengers.adopt_single_account(unread.source);}
+                    // 未识别提醒是点开那一刻才补绑账号的：先把当前唯一在线账号记进账本并改绑提醒，
+                    // 前台确认才认得它；账号这时已经退出的话，提醒随即由「已退出」清理收掉。
+                    let unread=if unread.pid==0{
+                        match self.messengers.adopt_single_account(unread.source){
+                            Some(bound)=>{self.app.rebind_messenger_unread(unread,bound);bound}
+                            None=>unread,
+                        }
+                    }else{unread};
                     match self.messengers.foreground(&[unread.source]){
                         Some((source,pid)) if unread.pid==0||unread.pid==pid=>{
                             self.messengers.viewed_client(source,pid);self.app.viewed_client(source,pid);
@@ -634,6 +647,14 @@ impl eframe::App for Shell {
                             continue;
                         }
                         if self.tray_opening.is_some(){self.app.messenger_unavailable(OpenError::Busy.message(unread.source));ctx.request_repaint();continue;}
+                        // 账号不明的提醒（QQ 群消息常见）：点开的这一刻就把当前唯一在线账号绑到这条提醒上，
+                        // 否则前台确认永远认不出它，提醒会一直挂在岛上，关掉 QQ 也不会消。
+                        let unread=if unread.pid==0{
+                            match self.messengers.adopt_single_account(unread.source){
+                                Some(bound)=>{self.app.rebind_messenger_unread(unread,bound);bound}
+                                None=>unread,
+                            }
+                        }else{unread};
                         match self.messengers.request(unread,&self.app.settings).start(ctx.clone()){
                             Ok(rx)=>self.tray_opening=Some((unread,rx)),
                             Err(error)=>{self.app.messenger_unavailable(error.message(unread.source));ctx.request_repaint();}

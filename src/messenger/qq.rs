@@ -182,8 +182,8 @@ mod tests{
     #[ignore="需要本机正在运行 QQ，仅用于现场验证补绑账号能进运行时账本"]
     fn live_adopt_single_account(){
         let mut runtime=crate::messenger::Runtime::default();
-        let ok=runtime.adopt_single_account(crate::app::Messenger::Qq);
-        println!("adopt_single_account = {ok}");
-        assert!(ok,"应当能把唯一在线 QQ 账号记进账本");
+        let bound=runtime.adopt_single_account(crate::app::Messenger::Qq);
+        println!("adopt_single_account = {bound:?}");
+        assert!(bound.is_some(),"应当能把唯一在线 QQ 账号记进账本");
     }
 }

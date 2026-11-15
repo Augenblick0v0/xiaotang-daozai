@@ -261,11 +261,13 @@ impl Default for Runtime {
 }
 impl Runtime {
     /// 点开时补绑的账号要进运行时账本：否则后面「前台确认」会把 QQ 当未知账号，拒绝收掉提醒。
-    pub fn adopt_single_account(&mut self,source:Messenger)->bool{
-        let Some(discover)=source.adapter().native.accounts else{return false};
-        let Some(accounts)=discover(&client_paths(source)) else{return false};
-        let [account]=accounts.as_slice() else{return false};
-        self.track_unread(account.unread).is_ok()
+    /// 只有线上恰好一个账号时才算绑定成功，返回绑到的那个账号。
+    pub fn adopt_single_account(&mut self,source:Messenger)->Option<Unread>{
+        let discover=source.adapter().native.accounts?;
+        let accounts=discover(&client_paths(source))?;
+        let [account]=accounts.as_slice() else{return None};
+        self.track_unread(account.unread).ok()?;
+        Some(account.unread)
     }
     pub fn foreground(&self,sources:&[Messenger])->Option<(Messenger,u32)>{
         let (client,pid)=foreground_client(sources)?;

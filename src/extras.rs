@@ -290,6 +290,17 @@ impl App {
         self.clear_account_notices(unread.source,unread.pid);
         if !self.pending_messengers.iter().any(|current|current.source==unread.source){self.clear_messenger_notices(unread.source);}
     }
+    /// 未识别提醒在点开那一刻才补绑到具体账号：把待清提醒和挂着的横幅一起换成带 pid 的那条，
+    /// 之后「前台确认」与「账号已退出」两条清理路径才认得出它（pid 0 的提醒自己永远清不掉）。
+    pub fn rebind_messenger_unread(&mut self,from:crate::app::Unread,to:crate::app::Unread)->bool{
+        if from.source!=to.source || from==to{return false;}
+        let Some(index)=self.pending_messengers.iter().position(|current|*current==from) else{return false};
+        self.pending_messengers[index]=to;
+        for alert in self.alerts.iter_mut().chain(self.notice.iter_mut()).chain(self.hud_notice.iter_mut()){
+            if alert.unread==Some(from){alert.unread=Some(to);}
+        }
+        true
+    }
     fn clear_account_notices(&mut self,source:crate::app::Messenger,pid:u32){
         let matches=|notice:&Alert|notice.unread.is_some_and(|u|u.source==source && u.pid==pid);
         self.alerts.retain(|notice|!matches(notice));
@@ -312,6 +323,10 @@ impl App {
             }
             return;
         }
+        // 已经绑到具体账号的提醒：再来一条账号不明的同源提醒，就是同一个账号的又一条消息，别重复计数。
+        // 只限系统通知类客户端（QQ）：任务栏闪动类的未知账号是另一回事，仍要单独计一条。
+        if pid==0 && source.adapter().capture==crate::messenger::Capture::SystemToast && source.adapter().keep_unidentified
+            && self.pending_messengers.iter().any(|u|u.source==source && u.pid!=0){return;}
         self.pending_messengers.push(crate::app::Unread{source,pid,window});
     }
     /// 横幅「查看」：跳到该来源最近一条未读的窗口。
