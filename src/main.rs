@@ -458,9 +458,9 @@ impl eframe::App for Shell {
                 while let Ok(event)=rx.try_recv(){match event {
                     daozai::system::Incoming::Revoked=>{self.app.settings.read_notifications=false;self.app.settings.save();},
                     daozai::system::Incoming::Status(s)=>self.app.listener_status=s,
-                    daozai::system::Incoming::Message(a,id,b,target)=>{
+                    daozai::system::Incoming::Message(a,id,b,target,toast)=>{
                         if target.is_some_and(|target|self.messengers.track(target)==Err(OpenError::Exited)){continue;}
-                        self.app.receive_notification_from(a,id,b,target.map(|target|target.unread));
+                        self.app.receive_notification_toast(a,id,b,target.map(|target|target.unread),toast);
                     }
                 }}
             }
@@ -645,6 +645,8 @@ impl eframe::App for Shell {
                         // 账号不明的提醒（QQ 群消息常见）：点开的这一刻就把当前唯一在线账号记进运行时账本，
                         // 否则后面的前台确认认不出它，提醒只能等「账号退出」才消得掉。
                         if unread.pid==0{self.messengers.adopt_single_account(unread.source);}
+                        // 通知里带了会话地址就直接跳那一条聊天（等价于用户点系统通知），下面再把窗口抬到前台。
+                        if let Some(uri)=self.app.messenger_launch(unread){daozai::native::open_uri(&uri);}
                         match self.messengers.request(unread,&self.app.settings).start(ctx.clone()){
                             Ok(rx)=>self.tray_opening=Some((unread,rx)),
                             Err(error)=>{self.app.messenger_unavailable(error.message(unread.source));ctx.request_repaint();}
