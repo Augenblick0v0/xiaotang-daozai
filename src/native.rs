@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use crate::poll_clock::PollClock;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CombineRgn, CreatePolygonRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, SetWindowRgn, HRGN, RGN_OR, WINDING};
+use windows::Win32::Graphics::Gdi::{CombineRgn, CreatePolygonRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromWindow, SetWindowRgn, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_OR, WINDING};
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState,VK_LBUTTON,VK_RBUTTON};
@@ -320,16 +320,23 @@ unsafe fn apply_style(hwnd: HWND, editing: bool, raise: bool) {
 
 /// 别的进程的可见窗口压在我们上面并盖住岛体（全屏播放器、游戏这类自己也置顶的窗口常见）。
 /// 置顶窗口之间的先后由激活顺序决定，因此只能重新 `SetWindowPos(HWND_TOPMOST)` 抬回置顶带顶部。
-unsafe fn covered_by_other(hwnd: HWND) -> bool {
+///
+/// 只认「占满一整块屏幕」的窗口：输入法候选框、通知、开始菜单这些置顶浮层也会叠在岛体上，
+/// 抢到它们上面反而会挡住用户正在用的东西。
+unsafe fn covering_window(hwnd: HWND) -> Option<HWND> {
     let mut rect = RECT::default();
     if GetWindowRect(hwnd, &mut rect).is_err() {
-        return false;
+        return None;
     }
     let mut above = GetWindow(hwnd, GW_HWNDPREV).unwrap_or_default();
-    // 只看紧挨着的几层：桌面带、任务栏和输入法窗口足够靠下时不该触发。
-    for _ in 0..8 {
+    // 置顶带整段都在非置顶窗口之上，所以沿 z 序往上走、遇到第一个非置顶窗口就可以停；
+    // 只在紧挨着的几层里找会漏掉中间夹着的托盘、输入法这类小置顶窗。
+    for _ in 0..256 {
         if above.0.is_null() {
-            return false;
+            return None;
+        }
+        if GetWindowLongPtrW(above, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as isize == 0 {
+            return None;
         }
         if IsWindowVisible(above).as_bool() {
             let mut pid = 0;
@@ -342,13 +349,98 @@ unsafe fn covered_by_other(hwnd: HWND) -> bool {
                 && other.right > rect.left
                 && other.top < rect.bottom
                 && other.bottom > rect.top
+                && fills_monitor(above, &other)
             {
-                return true;
+                return Some(above);
             }
         }
         above = GetWindow(above, GW_HWNDPREV).unwrap_or_default();
     }
-    false
+    None
+}
+
+/// 这个窗口是否几乎占满它所在的那块屏幕（全屏应用的特征，浮层都到不了这个量级）。
+unsafe fn fills_monitor(hwnd: HWND, rect: &RECT) -> bool {
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+        return false;
+    }
+    let area = |r: &RECT| (r.right - r.left).max(0) as i64 * (r.bottom - r.top).max(0) as i64;
+    let screen = area(&info.rcMonitor);
+    screen > 0 && area(rect) * 100 >= screen * 90
+}
+
+/// 盖住岛体的那个窗口是谁：类名、pid、exe。诊断日志里用来确认是哪款全屏应用。
+unsafe fn describe(hwnd: HWND) -> String {
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    let mut pid = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    let mut class = [0u16; 128];
+    let len = GetClassNameW(hwnd, &mut class) as usize;
+    let class = String::from_utf16_lossy(&class[..len.min(class.len().saturating_sub(1))]);
+    let mut exe = String::new();
+    if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+        let mut path = [0u16; 1024];
+        let mut length = path.len() as u32;
+        if QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(path.as_mut_ptr()), &mut length).is_ok() {
+            let full = String::from_utf16_lossy(&path[..length as usize]);
+            exe = full.rsplit(['\\', '/']).next().unwrap_or(&full).to_string();
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+    }
+    format!("{class} pid {pid} {exe}")
+}
+
+/// 全屏应用会持续重申自己的置顶，靠主线程每帧重抬会被它的刷新节奏盖回去（静止时一秒才一帧）。
+/// 这里起一个很轻的守护线程：只在真的被全屏窗口压住时，每 15ms 重申一次岛体的置顶，
+/// 不做任何绘制；长时间没被压住就退回 200ms 检查一次。
+fn watch_topmost(hwnd: HWND, ctx: eframe::egui::Context) {
+    // HWND 不是 Send，线程里用原始指针值重建（同 watch_drag）。
+    let raw = hwnd.0 as isize;
+    let _ = std::thread::Builder::new().name("daozai-topmost".into()).spawn(move || {
+        // 抢回层级后不能马上退回慢检查：一旦我们赢了，检测就看不到「被压住」，
+        // 对方下一次重申又会盖回来。所以赢了之后继续按住 2 秒，这段期间每 10ms 重申一次。
+        let mut hold_until: Option<std::time::Instant> = None;
+        loop {
+            let found = unsafe {
+                let hwnd = HWND(raw as *mut _);
+                if !IsWindow(hwnd).as_bool() { return; }
+                covering_window(hwnd)
+            };
+            if let Some(other) = found {
+                if hold_until.is_none() {
+                    unsafe {
+                        crate::resources::append_log(
+                            &crate::model::config_dir().join("diagnostics"),
+                            "topmost",
+                            &format!("被全屏窗口压住：{}；岛体重新抬回置顶", describe(other)),
+                        );
+                    }
+                }
+                hold_until = Some(std::time::Instant::now() + Duration::from_secs(2));
+            }
+            let holding = hold_until.map(|until| std::time::Instant::now() < until).unwrap_or(false);
+            if holding {
+                unsafe {
+                    let hwnd = HWND(raw as *mut _);
+                    let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+                // 抢回层级后让岛体重画一次，避免合成器留着被盖住时的旧画面。
+                ctx.request_repaint_after(Duration::from_millis(120));
+                std::thread::sleep(Duration::from_millis(10));
+            } else {
+                if hold_until.is_some() {
+                    hold_until = None;
+                    crate::resources::append_log(
+                        &crate::model::config_dir().join("diagnostics"),
+                        "topmost",
+                        "全屏窗口已让开，停止重申置顶",
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    });
 }
 
 fn surface_needs_outline_clip(backend:Option<eframe::wgpu::Backend>,vendor:&str,renderer:&str)->bool {
@@ -374,8 +466,6 @@ pub struct Window {
     blur: bool,
     blur_unavailable: bool,
     opaque_surface: bool,
-    /// 被别的置顶窗口压住时重新抬高，限制频率避免双方互相抬高。
-    raise_clock: PollClock,
 }
 
 impl Window {
@@ -408,7 +498,8 @@ impl Window {
         let opaque_surface=surface_needs_outline_clip(backend,&vendor,&renderer);
         if opaque_surface{glass_diagnostic("渲染兼容：已启用岛体轮廓裁剪，避免透明画布出现黑块");}
         watch_drag(hwnd,cc.egui_ctx.clone());
-        Some(Self { hwnd, region: (i32::MIN, 0, 0, 0), expanded: false, hook, browser_state:(None,PollClock::default()), drag_capture:DragCapture::default(), glass:None, backdrop:None, blur:false, blur_unavailable:false, opaque_surface, raise_clock:PollClock::default() })
+        watch_topmost(hwnd,cc.egui_ctx.clone());
+        Some(Self { hwnd, region: (i32::MIN, 0, 0, 0), expanded: false, hook, browser_state:(None,PollClock::default()), drag_capture:DragCapture::default(), glass:None, backdrop:None, blur:false, blur_unavailable:false, opaque_surface })
     }
 
     /// 使用目标屏幕的物理坐标定位，并在缩放、岛体大小、水平位置或屏幕连接变化后重新校正。
@@ -552,10 +643,9 @@ impl Window {
             }
             None => {}
         }
-        // 全屏播放器、游戏窗口常常自己也置顶，会把岛体压到下面；发现被盖住就抬回置顶带顶部。
-        let covered=self.raise_clock.ready(Duration::from_millis(400)) && unsafe{covered_by_other(self.hwnd)};
-        if covered {self.raise_clock=PollClock::now();}
-        unsafe { apply_style(self.hwnd, editing, expanded && !self.expanded || covered) };
+        // 被全屏应用压住由 watch_topmost 守护线程按 15ms 重抬处置（静止时主线程一秒才画一帧，
+        // 靠这一帧去抢层级抢不过对方每几十毫秒一次的重申）。
+        unsafe { apply_style(self.hwnd, editing, expanded && !self.expanded) };
         self.expanded = expanded;
     }
 }
@@ -590,7 +680,7 @@ mod tests {
             let hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,windows::core::w!("STATIC"),windows::core::w!(""),WS_POPUP,-10000,-10000,px(400.0),px(200.0),None,None,None,None).unwrap();
             let saved=hit().lock().unwrap_or_else(|e|e.into_inner()).clone();
             {
-                let mut native=Window{hwnd,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable,opaque_surface:surface_needs_outline_clip(backend,vendor,renderer),raise_clock:PollClock::default()};
+                let mut native=Window{hwnd,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable,opaque_surface:surface_needs_outline_clip(backend,vendor,renderer)};
                 let shapes=[crate::app::GlassShape::Round(eframe::egui::Rect::from_min_max(eframe::egui::pos2(80.0,60.0),eframe::egui::pos2(320.0,160.0)),25.0)];
                 native.update((0.0,0.0,400.0,200.0),(80.0,60.0,240.0,100.0),None,None,Some(&shapes),ppp,false,false);
                 let region=CreateRectRgn(0,0,0,0);
@@ -694,7 +784,7 @@ mod tests {
             assert!(above(cover.0,island.0),"先复现其他窗口盖住岛体");
             let foreground=GetForegroundWindow();
             let saved=hit().lock().unwrap_or_else(|e|e.into_inner()).clone();
-            let mut native=Window{hwnd:island.0,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable:false,opaque_surface:false,raise_clock:PollClock::default()};
+            let mut native=Window{hwnd:island.0,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable:false,opaque_surface:false};
             let update=|native:&mut Window,expanded|native.update((0.0,0.0,416.0,140.0),(0.0,0.0,416.0,140.0),None,None,None,1.0,false,expanded);
             update(&mut native,true);
             assert!(above(island.0,cover.0),"展开时必须重新抬高实际窗口层级，不能只检查置顶标记");
