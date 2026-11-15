@@ -318,39 +318,6 @@ unsafe fn apply_style(hwnd: HWND, editing: bool, raise: bool) {
     }
 }
 
-/// 别的进程的可见窗口压在我们上面并盖住岛体（全屏播放器、游戏这类自己也置顶的窗口常见）。
-/// 置顶窗口之间的先后由激活顺序决定，因此只能重新 `SetWindowPos(HWND_TOPMOST)` 抬回置顶带顶部。
-unsafe fn covered_by_other(hwnd: HWND) -> bool {
-    let mut rect = RECT::default();
-    if GetWindowRect(hwnd, &mut rect).is_err() {
-        return false;
-    }
-    let mut above = GetWindow(hwnd, GW_HWNDPREV).unwrap_or_default();
-    // 只看紧挨着的几层：桌面带、任务栏和输入法窗口足够靠下时不该触发。
-    for _ in 0..8 {
-        if above.0.is_null() {
-            return false;
-        }
-        if IsWindowVisible(above).as_bool() {
-            let mut pid = 0;
-            GetWindowThreadProcessId(above, Some(&mut pid));
-            let mut other = RECT::default();
-            if pid != 0
-                && pid != GetCurrentProcessId()
-                && GetWindowRect(above, &mut other).is_ok()
-                && other.left < rect.right
-                && other.right > rect.left
-                && other.top < rect.bottom
-                && other.bottom > rect.top
-            {
-                return true;
-            }
-        }
-        above = GetWindow(above, GW_HWNDPREV).unwrap_or_default();
-    }
-    false
-}
-
 fn surface_needs_outline_clip(backend:Option<eframe::wgpu::Backend>,vendor:&str,renderer:&str)->bool {
     use eframe::wgpu::Backend;
     if matches!(backend,Some(Backend::Dx12|Backend::Vulkan)){return true;}
@@ -374,8 +341,6 @@ pub struct Window {
     blur: bool,
     blur_unavailable: bool,
     opaque_surface: bool,
-    /// 被别的置顶窗口压住时重新抬高，限制频率避免双方互相抬高。
-    raise_clock: PollClock,
 }
 
 impl Window {
@@ -408,7 +373,7 @@ impl Window {
         let opaque_surface=surface_needs_outline_clip(backend,&vendor,&renderer);
         if opaque_surface{glass_diagnostic("渲染兼容：已启用岛体轮廓裁剪，避免透明画布出现黑块");}
         watch_drag(hwnd,cc.egui_ctx.clone());
-        Some(Self { hwnd, region: (i32::MIN, 0, 0, 0), expanded: false, hook, browser_state:(None,PollClock::default()), drag_capture:DragCapture::default(), glass:None, backdrop:None, blur:false, blur_unavailable:false, opaque_surface, raise_clock:PollClock::default() })
+        Some(Self { hwnd, region: (i32::MIN, 0, 0, 0), expanded: false, hook, browser_state:(None,PollClock::default()), drag_capture:DragCapture::default(), glass:None, backdrop:None, blur:false, blur_unavailable:false, opaque_surface })
     }
 
     /// 使用目标屏幕的物理坐标定位，并在缩放、岛体大小、水平位置或屏幕连接变化后重新校正。
@@ -552,10 +517,7 @@ impl Window {
             }
             None => {}
         }
-        // 全屏播放器、游戏窗口常常自己也置顶，会把岛体压到下面；发现被盖住就抬回置顶带顶部。
-        let covered=self.raise_clock.ready(Duration::from_millis(400)) && unsafe{covered_by_other(self.hwnd)};
-        if covered {self.raise_clock=PollClock::now();}
-        unsafe { apply_style(self.hwnd, editing, expanded && !self.expanded || covered) };
+        unsafe { apply_style(self.hwnd, editing, expanded && !self.expanded) };
         self.expanded = expanded;
     }
 }
@@ -590,7 +552,7 @@ mod tests {
             let hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,windows::core::w!("STATIC"),windows::core::w!(""),WS_POPUP,-10000,-10000,px(400.0),px(200.0),None,None,None,None).unwrap();
             let saved=hit().lock().unwrap_or_else(|e|e.into_inner()).clone();
             {
-                let mut native=Window{hwnd,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable,opaque_surface:surface_needs_outline_clip(backend,vendor,renderer),raise_clock:PollClock::default()};
+                let mut native=Window{hwnd,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable,opaque_surface:surface_needs_outline_clip(backend,vendor,renderer)};
                 let shapes=[crate::app::GlassShape::Round(eframe::egui::Rect::from_min_max(eframe::egui::pos2(80.0,60.0),eframe::egui::pos2(320.0,160.0)),25.0)];
                 native.update((0.0,0.0,400.0,200.0),(80.0,60.0,240.0,100.0),None,None,Some(&shapes),ppp,false,false);
                 let region=CreateRectRgn(0,0,0,0);
@@ -694,7 +656,7 @@ mod tests {
             assert!(above(cover.0,island.0),"先复现其他窗口盖住岛体");
             let foreground=GetForegroundWindow();
             let saved=hit().lock().unwrap_or_else(|e|e.into_inner()).clone();
-            let mut native=Window{hwnd:island.0,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable:false,opaque_surface:false,raise_clock:PollClock::default()};
+            let mut native=Window{hwnd:island.0,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable:false,opaque_surface:false};
             let update=|native:&mut Window,expanded|native.update((0.0,0.0,416.0,140.0),(0.0,0.0,416.0,140.0),None,None,None,1.0,false,expanded);
             update(&mut native,true);
             assert!(above(island.0,cover.0),"展开时必须重新抬高实际窗口层级，不能只检查置顶标记");
