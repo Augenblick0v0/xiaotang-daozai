@@ -423,14 +423,7 @@ impl eframe::App for Shell {
                 self.system_ready=true;
                 self.fullscreen=observation.fullscreen;
             }
-            let hidden=daozai::display_layout::hide_for_fullscreen(self.app.settings.hide_fullscreen,self.fullscreen,daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id).map(|d|d.bounds));
-            // 岛体凭空消失时唯一的原因就是这里：留一条状态切换记录，事后能判断是全屏隐藏、
-            // 还是真的被别的窗口压住。
-            if hidden!=self.hidden {
-                let what=match self.fullscreen {Some(_)=>"全屏窗口盖住本屏",None=>"没有全屏窗口"};
-                daozai::resources::append_log(&daozai::model::config_dir().join("diagnostics"),"fullscreen",&format!("{}｜{}",if hidden{"岛体隐藏"}else{"岛体显示"},what));
-            }
-            self.hidden=hidden;
+            self.hidden=daozai::display_layout::hide_for_fullscreen(self.app.settings.hide_fullscreen,self.fullscreen,daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id).map(|d|d.bounds));
             // 毛玻璃：在岛体左右两侧和画布底边（都在窗口区域之外）取样，估计岛背后的明暗。
             if self.app.settings.skin.is_glass() && !self.hidden {
                 let sampler=self.backdrop.get_or_insert_with(daozai::backdrop::Sampler::start);

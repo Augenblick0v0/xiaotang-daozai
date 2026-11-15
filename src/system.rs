@@ -242,12 +242,7 @@ pub fn fullscreen() -> Option<crate::display_layout::Bounds> {
             && r.top <= info.rcMonitor.top
             && r.right >= info.rcMonitor.right
             && r.bottom >= info.rcMonitor.bottom;
-        // 最大化窗口的矩形比屏幕各大出一圈非客户区（实测 (-8,-8)-(2568,1448) 对 2560x1440），
-        // 只看「盖满整块屏幕」就会把最大化的浏览器、资源管理器当成全屏，于是用户一最大化
-        // 岛体就被「全屏隐藏」吞掉，看起来像是被别人盖住了。IsZoomed 只对最大化窗口为真，
-        // 真正的全屏（F11、无边框游戏）处于非最大化状态，因此用它把两类情况分开。
-        let zoomed=IsZoomed(hwnd).as_bool();
-        (covers && !zoomed).then_some(crate::display_layout::Bounds {left:info.rcMonitor.left,top:info.rcMonitor.top,right:info.rcMonitor.right,bottom:info.rcMonitor.bottom})
+        covers.then_some(crate::display_layout::Bounds {left:info.rcMonitor.left,top:info.rcMonitor.top,right:info.rcMonitor.right,bottom:info.rcMonitor.bottom})
     }
 }
 pub(crate) fn is_browser_process(name:&str)->bool {
