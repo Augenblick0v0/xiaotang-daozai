@@ -139,4 +139,51 @@ mod tests{
         assert_eq!(one.unwrap().len(),1);assert!(before);assert!(!after,"已经绑定的 QQ 目标在出现同进程多主窗口后也不能继续猜测唤起");
         assert!(ambiguous.is_none(),"同进程多个 QQ 主窗口不能随便拿第一个当成唯一账号");
     }}
+    #[test]
+    #[ignore="需要本机正在运行 QQ，仅用于现场诊断"]
+    fn live_probe(){
+        unsafe{
+            use windows::Win32::Foundation::BOOL;
+            let paths=paths();println!("paths={paths:?}");
+            struct S<'a>{paths:&'a [String],hosts:Vec<HWND>,mains:Vec<HWND>}
+            unsafe extern "system" fn visit(hwnd:HWND,data:LPARAM)->BOOL{
+                let search=&mut *(data.0 as *mut S);
+                let class=class_name(hwnd);
+                let tray=class=="Electron_NotifyIconHostWindow";
+                let main=client_main_frame(Messenger::Qq,&class,GetWindowLongW(hwnd,GWL_STYLE)as u32,GetWindowLongW(hwnd,GWL_EXSTYLE)as u32) && GetWindow(hwnd,GW_OWNER).is_err();
+                if (tray||main) && matches(hwnd,search.paths){
+                    println!("候选 {} {:#x} pid {} 样式 0x{:08X}/0x{:08X}",if tray{"托盘宿主"}else{"主窗口"},hwnd.0 as usize,window_pid(hwnd),GetWindowLongW(hwnd,GWL_STYLE)as u32,GetWindowLongW(hwnd,GWL_EXSTYLE)as u32);
+                    if tray{search.hosts.push(hwnd);}else{search.mains.push(hwnd);}
+                }
+                true.into()
+            }
+            let mut search=S{paths:&paths,hosts:Vec::new(),mains:Vec::new()};
+            let _=EnumWindows(Some(visit),LPARAM((&mut search as *mut S)as isize));
+            for &host in &search.hosts{
+                let icons=host_icons(&[(window_pid(host),host)],window_pid(host));
+                println!("宿主 {:#x} pid {} 图标 {:?}",host.0 as usize,window_pid(host),icons);
+            }
+            println!("accounts = {:?}",accounts(&paths));
+            println!("parent_processes 数量 {}",parent_processes().len());
+        }
+    }
+
+    #[test]
+    #[ignore="需要本机正在运行 QQ，仅用于现场验证 pid=0 的 QQ 提醒能否补绑并唤起"]
+    fn live_open_unidentified_qq(){
+        let paths=paths();
+        let unread=crate::app::Unread::of(crate::app::Messenger::Qq);
+        let result=crate::messenger::windows::open_unread_with_paths(unread,&paths);
+        println!("pid=0 的 QQ 提醒打开结果 = {result:?}");
+        assert!(result.is_ok(),"应当能补绑到唯一 QQ 账号并唤起");
+    }
+
+    #[test]
+    #[ignore="需要本机正在运行 QQ，仅用于现场验证补绑账号能进运行时账本"]
+    fn live_adopt_single_account(){
+        let mut runtime=crate::messenger::Runtime::default();
+        let ok=runtime.adopt_single_account(crate::app::Messenger::Qq);
+        println!("adopt_single_account = {ok}");
+        assert!(ok,"应当能把唯一在线 QQ 账号记进账本");
+    }
 }

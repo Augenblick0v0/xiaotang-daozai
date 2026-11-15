@@ -1502,6 +1502,11 @@ impl App {
             && ctx.input(|i|!i.pointer.any_down() && !i.pointer.any_pressed() && i.raw.hovered_files.is_empty())
     }
 
+    /// 慢帧日志用：当前页与展开状态。
+    pub fn debug_state(&self) -> (usize, bool) {
+        (self.page, self.open)
+    }
+
     pub fn is_editing(&self) -> bool {
         self.adding || self.editing.is_some() || self.todo_choosing || self.task_dialog.is_some() || self.calendar.draft.is_some() || self.focus_editing
     }
@@ -1840,7 +1845,7 @@ impl App {
                             let changed=target!=*first;*first=target;changed
                         });
                         // 内容溢出时滚动列表并停在边界；未溢出时滚轮翻页。
-                        if !scrolled && !content_scrolls && !self.todo_choosing && self.t-self.wheel_page_at>=0.20 {
+                        if !scrolled && !content_scrolls && !self.todo_choosing && self.t-self.wheel_page_at>=0.08 {
                             self.navigate_page(next);
                             self.wheel_page_at=self.t;
                         }

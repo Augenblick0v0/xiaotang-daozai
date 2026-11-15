@@ -260,6 +260,13 @@ impl Default for Runtime {
         .filter(|client|client.adapter().native.taskbar.is_some()).map(|client|TaskbarEntry{client,source:None,retry:None,status:String::new()}).collect()}}
 }
 impl Runtime {
+    /// 点开时补绑的账号要进运行时账本：否则后面「前台确认」会把 QQ 当未知账号，拒绝收掉提醒。
+    pub fn adopt_single_account(&mut self,source:Messenger)->bool{
+        let Some(discover)=source.adapter().native.accounts else{return false};
+        let Some(accounts)=discover(&client_paths(source)) else{return false};
+        let [account]=accounts.as_slice() else{return false};
+        self.track_unread(account.unread).is_ok()
+    }
     pub fn foreground(&self,sources:&[Messenger])->Option<(Messenger,u32)>{
         let (client,pid)=foreground_client(sources)?;
         let pid=if client==Messenger::Qq{
@@ -374,17 +381,33 @@ impl OpenRequest {
     fn run(self)->Result<(),OpenError>{self.run_with_paths(&client_paths(self.unread.source))}
     pub(crate) fn run_with_paths(self,paths:&[String])->Result<(),OpenError>{
         use windows::Win32::{Foundation::WAIT_OBJECT_0,System::Threading::WaitForSingleObject};
-        let Some(target)=self.target else{
-            validate_unread_with(self.unread,client_processes)?;
-            return Err(if self.unread.pid==0{OpenError::Unidentified}else{OpenError::Unavailable});
+        let (unread,target)=match self.target{
+            Some(target)=>{
+                if target.unread!=self.unread{return Err(OpenError::Unavailable);}
+                (self.unread,target)
+            }
+            // 通知到达时没能绑定账号（群聊消息常见）时，点开这一刻按当前唯一在线的账号补绑。
+            None=>{
+                if Runtime::default().exited_with(&[self.unread],client_processes).contains(&self.unread){return Err(OpenError::Exited);}
+                if self.unread.pid!=0{return Err(OpenError::Unavailable);}
+                let target=single_account_target(self.unread.source,paths)?;
+                (target.unread,target)
+            }
         };
-        if target.unread!=self.unread{return Err(OpenError::Unavailable);}
         // 句柄保留到整个唤起结束，不能因提醒被关闭而提前允许进程号复用。
-        let process=check_target(target)?;let adapter=self.unread.source.adapter().native;
+        let process=check_target(target)?;let adapter=unread.source.adapter().native;
         if !(adapter.ready)(target){return Err(OpenError::Unavailable);}
-        let result=(adapter.open)(self.unread,paths,self.allow_tray);
+        let result=(adapter.open)(unread,paths,self.allow_tray);
         if unsafe{WaitForSingleObject(*process,0)==WAIT_OBJECT_0}{Err(OpenError::Exited)}else{result}
     }
+}
+/// 补绑只接受唯一在线账号：多开时无法判断提醒属于谁，仍按未识别处理。
+fn single_account_target(source:Messenger,paths:&[String])->Result<Target,OpenError>{
+    let accounts=(source.adapter().native.accounts).ok_or(OpenError::Unidentified)?(paths).ok_or(OpenError::Unidentified)?;
+    let [account]=accounts.as_slice() else{return Err(OpenError::Unidentified);};
+    let mut runtime=Runtime::default();
+    runtime.track_unread(account.unread)?;
+    runtime.targets.get(&account.unread).copied().ok_or(OpenError::Unidentified)
 }
 fn validate_unread_with(unread:Unread,discover:impl FnMut(Messenger)->Option<Vec<u32>>)->Result<(),OpenError>{
     if Runtime::default().exited_with(&[unread],discover).contains(&unread){return Err(OpenError::Exited);}

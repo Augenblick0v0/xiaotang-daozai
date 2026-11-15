@@ -473,7 +473,11 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
                     let (version,body)=baseline.observe(number,created,client,tracked,body);
                     current.insert(number,version);
                     if let Some(body)=body{
-                        let target=client.filter(|client|client.adapter().capture==crate::messenger::Capture::SystemToast).and_then(|client|accounts.target(client,number,created));
+                        let target=client.filter(|client|client.adapter().capture==crate::messenger::Capture::SystemToast).map(|client|(client,accounts.target(client,number,created)))
+                            .and_then(|(client,target)|{
+                                if target.is_none(){crate::messenger::windows::trace(format!("通知 {id}·创建 {created} 未能绑定 {} 账号",client.name()));}
+                                target
+                            });
                         if !body.trim().is_empty(){messages.push((created,app,id,body,target));}
                     }
                 }

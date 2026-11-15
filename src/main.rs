@@ -329,6 +329,7 @@ impl eframe::App for Shell {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_start=Instant::now();
         if self.resource_at.ready(Duration::from_secs(30)){
             let (count,bytes)={let textures=ctx.tex_manager();let textures=textures.read();(textures.num_allocated(),textures.allocated().map(|(_,info)|info.bytes_used()).sum())};
             daozai::resources::TEXTURES.store(count,std::sync::atomic::Ordering::Relaxed);
@@ -502,8 +503,14 @@ impl eframe::App for Shell {
                 if !self.app.pending_messengers.contains(&unread){self.opening_messenger=None;}
                 else if started.elapsed()>=Duration::from_secs(4){
                     self.opening_messenger=None;
+                    // 未识别提醒是点开那一刻才补绑账号的：先把当前唯一在线账号记进账本，前台确认才认得它。
+                    if unread.pid==0{self.messengers.adopt_single_account(unread.source);}
                     match self.messengers.foreground(&[unread.source]){
-                        Some((source,pid)) if unread.pid==0||unread.pid==pid=>{self.messengers.viewed_client(source,pid);self.app.viewed_client(source,pid);},
+                        Some((source,pid)) if unread.pid==0||unread.pid==pid=>{
+                            self.messengers.viewed_client(source,pid);self.app.viewed_client(source,pid);
+                            // 账号是点开时才补绑的未识别提醒：客户端确已在前台，这条提醒也一并收掉。
+                            if unread.pid==0{self.app.discard_unread(unread);}
+                        },
                         _=>self.app.messenger_unavailable(format!("{}尚未切到前台，可点图标重试",unread.source.name())),
                     }
                 }
@@ -730,6 +737,13 @@ impl eframe::App for Shell {
         #[cfg(windows)] let repaint_after=if self.hidden{Duration::from_secs(1)}else{out.repaint_after};
         #[cfg(not(windows))] let repaint_after=out.repaint_after;
         schedule_repaint(ctx,repaint_after);
+        // 只记慢帧：卡顿反馈时能直接看出是渲染慢还是输入被吞（页面/展开状态一并记下）。
+        let elapsed=frame_start.elapsed();
+        if elapsed>=Duration::from_millis(60) {
+            let (page,open)=self.app.debug_state();
+            daozai::resources::append_log(&daozai::model::config_dir().join("diagnostics"),"frames",
+                &format!("帧 {:.0} ms｜页面 {}｜展开 {}",elapsed.as_secs_f64()*1000.0,page,open));
+        }
     }
 }
 
