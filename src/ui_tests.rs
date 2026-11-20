@@ -7912,10 +7912,11 @@ fn weather_page_transition_gallery(){
     };
     h.app.show_page(0);
     for _ in 0..90{h.frame(vec![]);}
-    h.app.show_page(crate::app::WEATHER_PAGE);
-    for i in 0..24{
+    shoot(&mut h,&mut r,"weather-before");
+    h.app.go(crate::app::WEATHER_PAGE,1.0);
+    for i in 0..30{
         h.frame(vec![]);
-        if [0,2,4,8,12,20].contains(&i){shoot(&mut h,&mut r,&format!("weather-transition-{i:02}"));}
+        shoot(&mut h,&mut r,&format!("weather-transition-{i:02}"));
     }
 }
 
@@ -9304,4 +9305,22 @@ fn every_module_settings_tab_maps_to_its_page(){
 /// 设置页的 AI 额度账号默认收起成一行；需要检查明细的测试先把所有账号展开。
 pub(crate) fn open_quota_details(h:&H){
     for account in &h.app.quota.config.accounts {h.ctx.data_mut(|d|d.insert_temp(egui::Id::new(("quota-account-open",account.id.clone())),true));}
+}
+
+/// 连续快速翻页时（页面高度 140→232…）展开进度 p 会反复回落；
+/// 顶栏的电池/日期/时钟不能因此从小药丸字号跳回大字号再跳回来（看起来像闪一下）。
+#[test]
+fn scrolling_through_pages_keeps_the_clock_from_jumping(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    h.app.show_page(0);
+    for _ in 0..90{h.frame(vec![]);}
+    assert!(h.app.header_m>0.999,"展开完成后顶栏应完全展开：{}",h.app.header_m);
+    let mut lowest=1.0f32;
+    for page in 1..=crate::app::WEATHER_PAGE {
+        if !h.app.settings.visible_pages[page]{continue;}
+        h.app.go(page,1.0);
+        for _ in 0..3{h.frame(vec![]);lowest=lowest.min(h.app.header_m);}
+    }
+    for _ in 0..40{h.frame(vec![]);lowest=lowest.min(h.app.header_m);}
+    assert!(lowest>0.999,"快速换页时顶栏布局不该回退（最低 {lowest}）");
 }
