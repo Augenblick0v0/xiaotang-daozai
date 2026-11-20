@@ -9219,3 +9219,18 @@ fn switching_to_a_taller_page_keeps_revealed_content_stable(){
     for _ in 0..60{h.frame(vec![]);lowest=lowest.min(h.app.reveal);}
     assert!(lowest>0.9,"换到更高的页面时已露出的内容不该闪一下（最低 {lowest}）");
 }
+
+#[test]
+fn scrolling_through_pages_keeps_the_clock_from_jumping(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    h.app.show_page(0);
+    for _ in 0..90{h.frame(vec![]);}
+    // 连续翻页时页高会变，展开进度反复回落；顶栏（电池/日期/时钟）的推进度不能跟着回退。
+    let mut lowest=1.0f32;
+    for page in 1..=crate::app::WEATHER_PAGE {
+        h.app.go(page,1.0);
+        for _ in 0..3{h.frame(vec![]);lowest=lowest.min(h.app.header_m);}
+    }
+    for _ in 0..40{h.frame(vec![]);lowest=lowest.min(h.app.header_m);}
+    assert!(lowest>0.999,"换页时顶栏不该回退（时钟会闪一下）；最低 {lowest}");
+}

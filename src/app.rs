@@ -722,6 +722,8 @@ pub struct App {
     /// 前台切换导致的强制收起：光标离开前不再自动展开。
     pub hover_lock: bool,
     pub(crate) reveal: f32,
+    /// 顶栏（电池/日期/时钟）的布局推进度；打开期间只往前推，不因换页回退。
+    pub(crate) header_m: f32,
     position_drag: Option<PositionDrag>,
     /// 拖动中和松手落位期间的窗口位置（未取整），落定后回到 `settings.island_offset`。
     drag_glide: Option<anim::Spring>,
@@ -929,6 +931,7 @@ impl App {
             leave_since: None,
             hover_lock: false,
             reveal: 0.0,
+            header_m: 0.0,
             position_drag: None,
             drag_glide: None,
             drag_lift: anim::Spring::new(0.0, LIFT_K.0, LIFT_K.1),
@@ -2875,8 +2878,13 @@ impl App {
     // ---------------------------------------------------------------
     fn shared_header(&mut self, base: &Card, cx: f32, p: f32, reveal: f32, env: &Env) {
         let local_cx = cx - base.origin.x;
+        // 顶栏（电池/日期/时钟）的布局推进度。换到更高的页面时 p 会瞬间回落，若直接用 p，
+        // 时钟会从小药丸字号跳回大字号再跳回来，看起来像「闪一下」；打开期间只往前推进。
+        let m = anim::ease_in_out(smoothstep(0.0, 0.85, p));
+        let m = if self.open { m.max(self.header_m) } else { m };
+        self.header_m = m;
         let fit=((WIN_W-32.0)/self.resident.target.width).min(1.0);
-        let fitted=base.scaled(local_cx,15.0,lerp(fit,1.0,p));
+        let fitted=base.scaled(local_cx,15.0,lerp(fit,1.0,m));
         let base=&fitted;
         let lyric=self.island_lyric().map(|(index,_)|index);
         let lyric_alpha=if self.island_lyrics_active() {1.0-smoothstep(0.0,0.35,p)}else{0.0};
@@ -2914,7 +2922,6 @@ impl App {
         if lyric_alpha>=0.997 {return;}
         let header=base.faded(1.0-lyric_alpha);
         let base=&header;
-        let m = anim::ease_in_out(smoothstep(0.0, 0.85, p));
         let clock = self.settings.clock_text(&env.clock);
         let show_battery=self.settings.show_battery && env.battery.is_some();
 
