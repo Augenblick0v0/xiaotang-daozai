@@ -2067,6 +2067,10 @@ impl App {
 
         // 内容只随形体「揭开」：不缩放，按面板裁剪，到 55% 才开始淡入
         let reveal = if self.open { smoothstep(0.50, 0.97, p) } else { smoothstep(0.55, 0.92, p) };
+        // 进度按「当前高度 / 目标高度」算，换到更高的页面（比如天气页 232 比音乐页 140 高）时
+        // 目标高度一变大，算出来的进度会瞬间回落，已经露出的日期和时钟就会闪一下。
+        // 打开期间只允许内容越来越清楚，已经被裁掉的部分不会因为换页重新淡入。
+        let reveal = if self.open { reveal.max(self.reveal) } else { reveal };
         self.reveal = reveal;
         let origin = self.content_origin(win);
         let clip = panel.intersect(win);

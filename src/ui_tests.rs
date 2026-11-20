@@ -7888,6 +7888,52 @@ fn qq_unknown_reminders_survive_viewing_other_accounts(){
 }
 
 #[test]
+#[ignore="按需导出「换页到天气」过渡中的实际画面"]
+fn weather_page_transition_gallery(){
+    let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let dest=std::path::PathBuf::from(std::env::var_os("DAOZAI_FEATURE_PREVIEW_DIR").expect("需指定预览目录"));std::fs::create_dir_all(&dest).unwrap();
+    let mut h=H::new();h.app.settings.pet=false;
+    let ppp=2.0;
+    let mut r=feature_raster();
+    let env_of=|t:f64|Env{t,clock:"09:41:00".into(),today:"2026-11-05".into(),date:"11月5日 周四".into(),battery:Some(76),bt_ready:true,..Default::default()};
+    let mut shoot=|h:&mut H,r:&mut crate::preview_raster::Raster,name:&str|{
+        let env=env_of(h.t);
+        let raw=egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(crate::app::CANVAS_W,WIN_H))),time:Some(h.t),focused:true,
+            viewports:std::iter::once((egui::ViewportId::ROOT,egui::ViewportInfo{native_pixels_per_point:Some(ppp),..Default::default()})).collect(),..Default::default()};
+        let app=&mut h.app;
+        let output=h.ctx.run(raw,|ctx|{egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx,|ui|{let win=Rect::from_min_size(ui.max_rect().min,Vec2::new(WIN_W,WIN_H));app.frame(ui,win,&env);});});
+        r.update_textures(&output.textures_delta);
+        r.buf.fill([0.20,0.24,0.32,1.0]);
+        r.draw(&h.ctx.tessellate(output.shapes,output.pixels_per_point),output.pixels_per_point);
+        let mut rgba=Vec::new();r.to_rgba8(&mut rgba);
+        let image=image::RgbaImage::from_raw((crate::app::CANVAS_W*ppp) as u32,(WIN_H*ppp) as u32,rgba).unwrap();
+        image::imageops::crop_imm(&image,0,0,(WIN_W*ppp) as u32,(WIN_H*ppp) as u32).to_image().save(dest.join(format!("{name}.png"))).unwrap();
+        r.free_textures(&output.textures_delta);
+    };
+    h.app.show_page(0);
+    for _ in 0..90{h.frame(vec![]);}
+    h.app.show_page(crate::app::WEATHER_PAGE);
+    for i in 0..24{
+        h.frame(vec![]);
+        if [0,2,4,8,12,20].contains(&i){shoot(&mut h,&mut r,&format!("weather-transition-{i:02}"));}
+    }
+}
+
+#[test]
+fn switching_to_a_taller_page_keeps_revealed_content_stable(){
+    let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.show_page(0);
+    for _ in 0..90{h.frame(vec![]);}
+    assert!(h.app.reveal>0.98,"展开完成后内容应完全露出：{}",h.app.reveal);
+    // 天气页比音乐页高（232 vs 140），面板还得再长高一段；这段时间里日期/时钟不能退回淡出。
+    h.app.show_page(crate::app::WEATHER_PAGE);
+    let mut lowest=1.0f32;
+    for _ in 0..60{h.frame(vec![]);lowest=lowest.min(h.app.reveal);}
+    assert!(lowest>0.9,"换到更高的页面时已露出的内容不该闪一下（最低 {lowest}）");
+}
+
+#[test]
 fn qq_avatar_and_launch_survive_the_toast_path_and_degrade_cleanly(){
     use crate::app::{Messenger,Unread};
     let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
