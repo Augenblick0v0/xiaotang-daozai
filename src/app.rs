@@ -3035,7 +3035,6 @@ impl App {
         if self.island_badge_reserve() > 0.0 && badge_quiet {
             if let Some(badge)=self.island_badge() {
                 let ring_r=5.5;
-                let ring_w=ring_r*2.0+4.0;
                 let rate=self.settings.task_island_speed && badge.rate>=1.0;
                 let text=if rate {
                     if badge.rate>=1000.0 {format!("{:.1}k t/s",badge.rate/1000.0)}else{format!("{:.0} t/s",badge.rate)}
@@ -3043,22 +3042,22 @@ impl App {
                 let progress=self.settings.task_island_progress.then_some(badge.progress).flatten();
                 // 右对齐贴在常驻内容左边：常驻布局以药丸中心居中，它的墨水从
                 // `local_cx - layout.width/2 + 16` 起排（16 是布局自带的内边距）。
-                // 预留出来的那 96 点由中心平分，所以从这条墨水线往回排一定落在空地，
-                // 就算药丸被歌词/HUD 撑宽了也不会跑到边上去压别的东西。
+                // 预留出来的那点宽度由中心平分，所以从这条墨水线往回排一定落在空地。
+                // 文字用右对齐锚（不靠量出来的宽度定位）：量宽和实际的字形宽度差一两个点
+                // 也只会把环推歪一点，不会让字压到电池/时钟上。
                 let ink_left=local_cx-layout.width/2.0+16.0;
-                let ring_w=if progress.is_some() {ring_w} else {0.0};
-                let mut x=ink_left-8.0-(ring_w+base.text_w(&text,9.5,W::Regular));
+                let anchor=ink_left-8.0;
+                if rate {
+                    base.text(anchor,18.6,&text,9.5,W::Regular,theme::GRAY,H::Right);
+                }
                 if let Some(progress)=progress {
-                    let center=(x+ring_r,BAR_H/2.0);
+                    let ring_x=anchor-base.text_w(&text,9.5,W::Regular)-4.0-ring_r*2.0;
+                    let center=(ring_x+ring_r,BAR_H/2.0);
                     base.ring(center.0,center.1,ring_r,2.0,theme::DIM);
                     let sweep=progress.clamp(0.0,1.0);
                     if sweep>0.002 {
                         base.arc(center.0,center.1,ring_r,-FRAC_PI_2,-FRAC_PI_2+TAU*sweep,2.0,theme::SOFT_GREEN);
                     }
-                    x+=ring_w;
-                }
-                if rate {
-                    base.text(x,18.6,&text,9.5,W::Regular,theme::GRAY,H::Left);
                 }
                 // 速度会随 token 继续涨：一秒重画一次就够，别为了角标整岛狂转。
                 base.ui.ctx().request_repaint_after(std::time::Duration::from_millis(1000));
