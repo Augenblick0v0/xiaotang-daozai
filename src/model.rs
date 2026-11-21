@@ -297,11 +297,13 @@ pub struct Settings {
     pub task_island_speed: bool,
     /// 收起态岛上用一圈小环显示当前任务的完成进度；拿不到真实待办就不画。
     pub task_island_progress: bool,
+    /// 收起态角标放在药丸哪一侧：0 = 左侧，1 = 右侧（内容会往反方向让出位置）。
+    pub task_badge_side: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, qq_avatar:true, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), task_sources: [true;3], task_keep_minutes: 30, task_hide_project: false, task_island_speed: true, task_island_progress: true }
+        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, qq_avatar:true, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), task_sources: [true;3], task_keep_minutes: 30, task_hide_project: false, task_island_speed: true, task_island_progress: true, task_badge_side: 0 }
     }
 }
 
@@ -403,6 +405,7 @@ impl Settings {
                 "task_hide_project" => s.task_hide_project = v=="1",
                 "task_island_speed" => s.task_island_speed = v=="1",
                 "task_island_progress" => s.task_island_progress = v=="1",
+            "task_badge_side" => s.task_badge_side = if v=="1" {1} else {0},
                 "system_hud" => s.system_hud = v != "0",
                 "bluetooth_notifications" => s.bluetooth_notifications = v != "0",
                 "notifications" => s.notifications = v != "0",
@@ -493,6 +496,7 @@ impl Settings {
                 ("task_hide_project".into(), (self.task_hide_project as u8).to_string()),
                 ("task_island_speed".into(), (self.task_island_speed as u8).to_string()),
                 ("task_island_progress".into(), (self.task_island_progress as u8).to_string()),
+            ("task_badge_side".into(), if self.task_badge_side==1 {"1"} else {"0"}.to_string()),
                 ("system_hud".into(), (self.system_hud as u8).to_string()),
                 ("bluetooth_notifications".into(), (self.bluetooth_notifications as u8).to_string()),
                 ("notifications".into(), (self.notifications as u8).to_string()),

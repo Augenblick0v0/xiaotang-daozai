@@ -775,6 +775,11 @@ impl eframe::App for Shell {
                         self.app.say(format!("没找到{}窗口",source.label()));
                     }
                 },
+                Cmd::ToggleTaskFold(id)=>{
+                    // 子 agent 默认折叠，点父行右侧那处小标记才展开：只是界面状态，不落盘。
+                    self.app.toggle_task_fold(&id);
+                    ctx.request_repaint();
+                },
                 Cmd::QuotaChooseFile=>{
                     #[cfg(windows)] match daozai::system::pick_files_for("选择 AI 账号的登录 JSON 文件",false){Ok(files)=>if let Some(path)=files.into_iter().next(){self.app.quota_set_source(path);},Err(_)=>self.app.say("无法选择登录文件")}
                 },

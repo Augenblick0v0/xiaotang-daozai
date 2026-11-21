@@ -4,7 +4,7 @@
 
 use crate::poll_clock::PollClock;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -124,6 +124,9 @@ pub struct TaskItem {
     /// 稳定唯一：`源前缀:会话 id`，例如 `"dsh:09613bbe-…"`。
     pub id: String,
     pub source: Source,
+    /// 父会话 id：只有 DSH 的子 agent 会话有（顶层会话为 `None`）。
+    /// 存的是裸会话 id —— 就是父行 `id` 里冒号后面那一段，也可直接喂给 `rate_with_children`。
+    pub parent: Option<String>,
     /// 会话标题，已压空白、去首尾、最多 200 字符。
     pub title: String,
     /// 工作目录名（cwd 最后一段），拿不到给空串。
@@ -210,7 +213,21 @@ pub fn scan(roots: &Roots, cfg: &ScanConfig) -> Vec<TaskItem> {
             .cmp(&stage_rank(b.stage))
             .then(b.updated_ms.cmp(&a.updated_ms))
     });
-    items.truncate(MAX_ITEMS);
+    // 截断不许把父子拆散：父行显示的是「父 + 子」的合计速度，子行被截掉之后
+    // 这个数字就成了凭空多出来的。所以留下的父会话，它的子会话一并留下（可能略微超 MAX_ITEMS）。
+    if items.len() > MAX_ITEMS {
+        let mut tail = items.split_off(MAX_ITEMS);
+        let kept_parents: HashSet<String> = items
+            .iter()
+            .filter(|it| it.parent.is_none())
+            .map(|it| it.id.clone())
+            .collect();
+        tail.retain(|it| match it.parent.as_deref() {
+            Some(parent) => kept_parents.contains(&format!("{}:{}", Source::Dsh.key(), parent)),
+            None => false,
+        });
+        items.extend(tail);
+    }
     items
 }
 
@@ -223,6 +240,43 @@ pub fn demote_stale(items: &mut [TaskItem], now_ms: i64) {
             it.stage = Stage::Done;
         }
     }
+}
+
+/// 全局总速度：岛上收起时显示的是这个，不是某一个会话的数字，避免数字一直跳。
+/// 只算还在 `alive()` 的条目（含 DSH 子会话）：收场会话留下的是最后一次采样的残值，
+/// 算进去总速度就永远停在一个非零值上、再也降不下来。
+pub fn total_rate(items: &[TaskItem]) -> f32 {
+    items
+        .iter()
+        .filter(|it| it.stage.alive())
+        .map(|it| it.rate)
+        .sum()
+}
+
+/// 父行要显示的合计速度：自己（还活着的话）加上它所有子 agent 会话。
+/// 子行只显示自己的 `rate`，别用这个 —— 否则父和子会把同一个数字显示两遍。
+/// `parent_id` 给 `TaskItem.parent` 里那个裸会话 id，给完整的 `dsh:<uuid>` 也认；
+/// 非 DSH 来源没有父子关系，等价于自己那条的 rate。
+pub fn rate_with_children(items: &[TaskItem], parent_id: &str) -> f32 {
+    let bare = parent_id
+        .split_once(':')
+        .map(|(_, rest)| rest)
+        .unwrap_or(parent_id);
+    let own = items
+        .iter()
+        .find(|it| {
+            it.id == parent_id || it.id.split_once(':').map(|(_, rest)| rest) == Some(bare)
+        })
+        .filter(|it| it.stage.alive())
+        .map(|it| it.rate)
+        .unwrap_or(0.0);
+    // 子会话收场了也不再算它的速度：那个数是最后一次采样的残值，挂了会一直占着。
+    let children: f32 = items
+        .iter()
+        .filter(|it| it.parent.as_deref() == Some(bare) && it.stage.alive())
+        .map(|it| it.rate)
+        .sum();
+    own + children
 }
 
 /// 每 2 秒在后台线程扫一次，结果通过通道回传，UI 线程永不阻塞。
@@ -525,6 +579,42 @@ fn dsh_row<'a>(rows: &'a Value, key: &str) -> Option<&'a Value> {
     rows.get(key)?.get("val")
 }
 
+/// 读一个 DSH 会话缓存文件，返回整份 JSON；坏文件 / 超大文件给 `None`。
+/// 父子关系（`subagentCatalog`）和会话字段在同一份 JSON 里，所以一个文件只读一次。
+fn dsh_load(path: &Path) -> Option<Value> {
+    let raw = fs::read(path).ok()?;
+    if raw.len() > 8 * 1024 * 1024 {
+        return None;
+    }
+    serde_json::from_slice(&raw).ok()
+}
+
+/// 父会话在 `subagentCatalog` 里登记着它派出去的子 agent 会话 id。
+/// 子会话缓存的文件名是裸 uuid（没有 `session-` 前缀），光看文件名认不出爹，
+/// 只能从父会话这边反查。结构实测为 `rows.subagentCatalog.val.head.values[].childId`。
+fn dsh_child_ids(root: &Value) -> Vec<String> {
+    let Some(catalog) = root
+        .get("record")
+        .and_then(|r| r.get("rows"))
+        .and_then(|rows| dsh_row(rows, "subagentCatalog"))
+    else {
+        return Vec::new();
+    };
+    // head 是个分页头（`{values:[…]}`）；日后结构变成直接给数组时也能读。
+    let values = catalog
+        .get("head")
+        .and_then(|head| head.get("values"))
+        .or_else(|| catalog.get("values"))
+        .and_then(Value::as_array);
+    let mut out = Vec::new();
+    for entry in values.into_iter().flatten() {
+        if let Some(id) = non_empty(entry.get("childId").and_then(Value::as_str)) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 fn scan_dsh(roots: &Roots, cutoff_ms: i64, now_ms: i64) -> Vec<TaskItem> {
     let dir = roots
         .dsh
@@ -535,6 +625,9 @@ fn scan_dsh(roots: &Roots, cutoff_ms: i64, now_ms: i64) -> Vec<TaskItem> {
         return Vec::new();
     };
     let mut out = Vec::new();
+    // 子会话 id → 父会话 id。一条会话要先读到**父**那一行才知道自己是谁的孩子，
+    // 所以这轮先全部扫出来，最后一并回填 `parent`。
+    let mut child_parent: HashMap<String, String> = HashMap::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.to_ascii_lowercase().ends_with(".json") {
@@ -555,12 +648,39 @@ fn scan_dsh(roots: &Roots, cutoff_ms: i64, now_ms: i64) -> Vec<TaskItem> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // 文件名规则只决定会话 id，不决定留不留：子 agent 会话就是裸 `<uuid>.json`，
+        // `strip_prefix` 落空时 stem 自己就是 id，所以子会话不会被这里漏掉。
         let session_id = stem.strip_prefix("session-").unwrap_or(&stem).to_string();
         if session_id.is_empty() {
             continue;
         }
-        if let Some(item) = parse_dsh(&roots.dsh, &path, &session_id, mtime, now_ms) {
+        let Some(root) = dsh_load(&path) else {
+            continue;
+        };
+        for child in dsh_child_ids(&root) {
+            // 同一个子会话可能被多个父登记过（转交 / 续聊），只认最先登记的那个父，别来回覆盖。
+            child_parent
+                .entry(child)
+                .or_insert_with(|| session_id.clone());
+        }
+        if let Some(item) = parse_dsh(&roots.dsh, &path, &session_id, mtime, now_ms, &root) {
             out.push(item);
+        }
+    }
+    if !child_parent.is_empty() {
+        for item in &mut out {
+            if item.source != Source::Dsh {
+                continue;
+            }
+            let Some(session_id) = item.id.split_once(':').map(|(_, rest)| rest) else {
+                continue;
+            };
+            if let Some(parent) = child_parent.get(session_id) {
+                // 自己登记自己（同一个 id 既是父又是子）是坏数据，别当真。
+                if parent != session_id {
+                    item.parent = Some(parent.clone());
+                }
+            }
         }
     }
     out
@@ -572,12 +692,8 @@ fn parse_dsh(
     session_id: &str,
     mtime: i64,
     now_ms: i64,
+    root: &Value,
 ) -> Option<TaskItem> {
-    let raw = fs::read(path).ok()?;
-    if raw.len() > 8 * 1024 * 1024 {
-        return None;
-    }
-    let root: Value = serde_json::from_slice(&raw).ok()?;
     let record = root.get("record")?;
     let rows = record.get("rows")?;
     let identity = record.get("identity").unwrap_or(&Value::Null);
@@ -755,6 +871,8 @@ fn parse_dsh(
     Some(TaskItem {
         id: format!("{}:{}", Source::Dsh.key(), session_id),
         source: Source::Dsh,
+        // 父子关系要等扫完所有会话才知道（子会话的父写在父那一行里），先留空。
+        parent: None,
         title: clean_title(&title),
         project,
         model,
@@ -1053,6 +1171,8 @@ fn parse_codex(path: &Path, mtime: i64) -> Option<TaskItem> {
     Some(TaskItem {
         id: format!("{}:{}", Source::Codex.key(), id_tail),
         source: Source::Codex,
+        // Codex 的子 agent 是同一个 rollout 里的 response_item，没有独立会话可挂。
+        parent: None,
         title: clean_title(&title),
         project,
         model: model.unwrap_or_default(),
@@ -1312,6 +1432,8 @@ fn parse_claude(path: &Path, stem: &str, mtime: i64) -> Option<TaskItem> {
     Some(TaskItem {
         id: format!("{}:{}", Source::Claude.key(), id_tail),
         source: Source::Claude,
+        // Claude 的子代理写在 agent-*.jsonl 里、本来就不进列表，所以没有父子关系。
+        parent: None,
         title: clean_title(&title),
         project,
         model: model.unwrap_or_default(),
@@ -1483,6 +1605,229 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].progress, None, "todos 为 null 时不许瞎估进度");
         assert_eq!(items[0].stage, Stage::Done);
+    }
+
+    /// 父会话 fixture：比 `dsh_session` 多一行 `subagentCatalog`（实测结构），
+    /// 里面登记着它派出的子 agent 会话 id。
+    fn dsh_parent_session(title: &str, children: &[&str], at: i64) -> String {
+        let mut value: Value = serde_json::from_str(&dsh_session(
+            title,
+            Value::Null,
+            "start",
+            Some(5),
+            at,
+        ))
+        .expect("fixture 必须先是合法 JSON");
+        let values: Vec<Value> = children
+            .iter()
+            .map(|child| {
+                serde_json::json!({
+                    "version": 3,
+                    "childId": child,
+                    "childCreatedAt": at - 30_000,
+                    "mode": "continuable",
+                    "label": "研究这个下载中心的来源",
+                    "name": "dl-probe",
+                })
+            })
+            .collect();
+        if let Some(rows) = value
+            .get_mut("record")
+            .and_then(|record| record.get_mut("rows"))
+            .and_then(Value::as_object_mut)
+        {
+            rows.insert(
+                "subagentCatalog".to_string(),
+                serde_json::json!({
+                    "ver": 1,
+                    "seq": 11,
+                    "val": {
+                        "inheritedEventCount": 0,
+                        "head": {"values": values},
+                    },
+                }),
+            );
+        }
+        value.to_string()
+    }
+
+    fn dsh_sessions_dir(root: &Path) -> PathBuf {
+        root.join("dsh")
+            .join("storages")
+            .join("session_projcache")
+            .join("sessions")
+    }
+
+    fn dsh_only_roots(root: &Path) -> Roots {
+        Roots {
+            dsh: root.join("dsh"),
+            codex: root.join("codex"),
+            claude: root.join("claude"),
+        }
+    }
+
+    #[test]
+    fn dsh_subagent_sessions_hang_under_their_parent() {
+        let now = now_ms();
+        let root = temp_root("dsh-subagents");
+        let sessions = dsh_sessions_dir(&root);
+        let parent_id = "09613bbe-d1a8-42eb-afec-59b27c83caa7";
+        // 子 agent 会话的缓存文件是**裸 uuid** 文件名（没有 session- 前缀）。
+        let child_a = "1332bfa5-4baa-4ddf-b93b-f690c3aba2a4";
+        let child_b = "2f8c1d40-9e77-4a11-8a6b-1c2d3e4f5a60";
+        write_file(
+            &sessions.join(format!("session-{parent_id}.json")),
+            &dsh_parent_session("整理下载中心的任务", &[child_a, child_b], now),
+        );
+        write_file(
+            &sessions.join(format!("{child_a}.json")),
+            &dsh_session(
+                "研究这个下载中心的来源",
+                Value::Null,
+                "start",
+                Some(5),
+                now,
+            ),
+        );
+        write_file(
+            &sessions.join(format!("{child_b}.json")),
+            &dsh_session("看下这个仓库的提交历史", Value::Null, "start", Some(5), now),
+        );
+        let roots = dsh_only_roots(&root);
+        let cfg = ScanConfig {
+            sources: all_on(),
+            keep_minutes: 30,
+            now_ms: now,
+        };
+        let items = scan(&roots, &cfg);
+        assert_eq!(
+            items.len(),
+            3,
+            "父 + 两个子都要扫出来（子会话是裸 uuid 文件名）：{items:?}"
+        );
+        let parent = items
+            .iter()
+            .find(|it| it.id == format!("dsh:{parent_id}"))
+            .unwrap_or_else(|| panic!("父会话没扫出来：{items:?}"));
+        assert_eq!(parent.parent, None, "顶层会话没有父");
+        for child in [child_a, child_b] {
+            let item = items
+                .iter()
+                .find(|it| it.id == format!("dsh:{child}"))
+                .unwrap_or_else(|| panic!("子会话 {child} 没扫出来：{items:?}"));
+            assert_eq!(
+                item.parent.as_deref(),
+                Some(parent_id),
+                "子会话 {child} 应当挂在父会话下"
+            );
+            assert_eq!(item.source, Source::Dsh, "子会话的来源仍然只按 DSH 算");
+        }
+    }
+
+    #[test]
+    fn truncation_never_splits_a_parent_from_its_children() {
+        // MAX_ITEMS=12：父 + 12 个子 = 13 条，按时间排最老的那个子项会被截掉。
+        // 父行显示的是「父 + 子」的合计速度，子行被截掉，那个数就成了凭空多出来的。
+        let now = now_ms();
+        let root = temp_root("dsh-truncate");
+        let sessions = dsh_sessions_dir(&root);
+        let parent_id = "09613bbe-d1a8-42eb-afec-59b27c83caa7";
+        let children: Vec<String> = (0..MAX_ITEMS)
+            .map(|i| format!("00000000-0000-0000-0000-0000000000{i:02}"))
+            .collect();
+        let refs: Vec<&str> = children.iter().map(String::as_str).collect();
+        // 间隔 10 秒拉开 updated_ms，免得排序并列、结果随机。
+        write_file(
+            &sessions.join(format!("session-{parent_id}.json")),
+            &dsh_parent_session("开一堆子 agent 干活", &refs, now + MAX_ITEMS as i64 * 10_000),
+        );
+        for (i, child) in children.iter().enumerate() {
+            write_file(
+                &sessions.join(format!("{child}.json")),
+                &dsh_session("子任务", Value::Null, "start", Some(5), now + i as i64 * 10_000),
+            );
+        }
+        let roots = dsh_only_roots(&root);
+        let cfg = ScanConfig {
+            sources: all_on(),
+            keep_minutes: 30,
+            now_ms: now,
+        };
+        let items = scan(&roots, &cfg);
+        assert_eq!(
+            items.len(),
+            MAX_ITEMS + 1,
+            "被留下的父会话，它的子会话一律不裁：{items:?}"
+        );
+        assert!(
+            items.iter().any(|it| it.id == format!("dsh:{parent_id}")),
+            "父会话要在列表里"
+        );
+        for child in &children {
+            assert!(
+                items.iter().any(|it| it.id == format!("dsh:{child}")),
+                "子会话 {child} 被截断了：{items:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn total_rate_sums_only_alive_tasks() {
+        let now = now_ms();
+        let mut tool = dsh_item(Stage::Tool, now);
+        tool.rate = 100.0;
+        let mut thinking = dsh_item(Stage::Thinking, now);
+        thinking.rate = 50.0;
+        // 收场的会话留着最后一次采样的残值，算进去总速度就永远降不下来。
+        let mut done = dsh_item(Stage::Done, now);
+        done.rate = 999.0;
+        assert_eq!(total_rate(&[tool, thinking, done]), 150.0);
+        assert_eq!(total_rate(&[]), 0.0);
+    }
+
+    #[test]
+    fn rate_with_children_adds_subagents_but_not_stale_ones() {
+        let now = now_ms();
+        let parent_id = "09613bbe-d1a8-42eb-afec-59b27c83caa7";
+        let mut parent = dsh_item(Stage::Tool, now);
+        parent.id = format!("dsh:{parent_id}");
+        parent.rate = 100.0;
+        let mut child_a = dsh_item(Stage::Tool, now);
+        child_a.id = "dsh:1332bfa5-4baa-4ddf-b93b-f690c3aba2a4".into();
+        child_a.parent = Some(parent_id.to_string());
+        child_a.rate = 50.0;
+        let mut child_b = dsh_item(Stage::Thinking, now);
+        child_b.id = "dsh:2f8c1d40-9e77-4a11-8a6b-1c2d3e4f5a60".into();
+        child_b.parent = Some(parent_id.to_string());
+        child_b.rate = 30.0;
+        let all = vec![parent.clone(), child_a.clone(), child_b.clone()];
+        assert_eq!(
+            rate_with_children(&all, parent_id),
+            180.0,
+            "父 100 + 子 50 + 子 30"
+        );
+        // 完整 id（`dsh:<uuid>`）也认，省得调用方还要自己截前缀。
+        assert_eq!(
+            rate_with_children(&all, &format!("dsh:{parent_id}")),
+            180.0
+        );
+        // 父已收场、子还活着：只算子项。
+        let mut done_parent = parent.clone();
+        done_parent.stage = Stage::Done;
+        assert_eq!(
+            rate_with_children(&[done_parent, child_a, child_b],
+                parent_id),
+            80.0
+        );
+        // 非 DSH 来源没有父子关系：等价于自己那条。
+        let mut solo = dsh_item(Stage::Tool, now);
+        solo.id = "codex:01a1f931-bd5c-7693-84d4-86ed8b87024a".into();
+        solo.source = Source::Codex;
+        solo.rate = 42.0;
+        assert_eq!(
+            rate_with_children(&[solo], "codex:01a1f931-bd5c-7693-84d4-86ed8b87024a"),
+            42.0
+        );
     }
 
     fn codex_line(value: Value) -> String {
@@ -1933,6 +2278,7 @@ mod tests {
         TaskItem {
             id: String::new(),
             source: Source::Dsh,
+            parent: None,
             title: "t".into(),
             project: "p".into(),
             model: "m".into(),
@@ -1998,7 +2344,7 @@ mod tests {
                 .unwrap_or_else(|| "无".to_string());
             let idle_min = now.saturating_sub(it.updated_ms) / 60_000;
             println!(
-                "{} {:<6} 进度={:<4} 本轮={:>4.1}分 {:>6.1}t/s {:>7}tok 更新={}分钟前 | {} | {} | {} | {}",
+                "{} {:<6} 进度={:<4} 本轮={:>4.1}分 {:>6.1}t/s {:>7}tok 更新={}分钟前 | {} | {} | {} | {} | 父={}",
                 it.source.short(),
                 it.stage.label(),
                 progress,
@@ -2009,11 +2355,36 @@ mod tests {
                 it.project,
                 it.model,
                 it.id,
-                it.title
+                it.title,
+                it.parent.as_deref().unwrap_or("—")
             );
             if let Some(log) = &it.log {
                 println!("    log = {}", log.display());
             }
+        }
+        // 岛上收起时看的就是这两个数：全局总速度，以及每条父会话的「父 + 子」合计。
+        println!(
+            "总速度 = {:.1} t/s（alive {} 条 / 共 {} 条）",
+            total_rate(&items),
+            items.iter().filter(|it| it.stage.alive()).count(),
+            items.len()
+        );
+        for it in items.iter().filter(|it| it.parent.is_none()) {
+            let children: Vec<&TaskItem> = items
+                .iter()
+                .filter(|child| child.parent.as_deref() == it.id.split_once(':').map(|(_, id)| id))
+                .collect();
+            if children.is_empty() {
+                continue;
+            }
+            println!(
+                "  {} 父自身 {:>6.1} + {} 个子 = {:>6.1} t/s | {}",
+                it.id,
+                it.rate,
+                children.len(),
+                rate_with_children(&items, &it.id),
+                it.title
+            );
         }
     }
 }

@@ -1186,7 +1186,11 @@ impl H {
         let dir = std::env::temp_dir().join(format!("daozai-test-{}-{}", std::process::id(), rand_id()));
         std::env::set_var("DAOZAI_DATA_DIR", &dir);
         let ctx = egui::Context::default();
-        let app = App::new(&ctx, Options { fetch_lyrics: false, pet_idle: 1e9 });
+        let mut app = App::new(&ctx, Options { fetch_lyrics: false, pet_idle: 1e9 });
+        // 测试不能受本机真实 AI 会话影响：收起态角标会去扫 ~/.dsh / ~/.codex，
+        // 那样同一份断言在这台机器上画出的药丸宽度和别的机器不一样。
+        app.settings.task_island_speed = false;
+        app.settings.task_island_progress = false;
         Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,interactive_transition:false,shapes:Vec::new(), bt:Vec::new(),media:Default::default(),power:(None,false),network:None,system_idle:None,screen_locked:false,fullscreen:false,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
     }
     fn frame(&mut self, events: Vec<egui::Event>) {
@@ -9364,7 +9368,7 @@ fn ai_task_page_gallery(){
     };
     let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
     let item=|id:&str,source:Source,title:&str,project:&str,model:&str,stage:Stage,progress:Option<f32>,mins:i64|TaskItem{
-        id:id.into(),source,title:title.into(),project:project.into(),model:model.into(),stage,progress,
+        id:id.into(),parent:None,source,title:title.into(),project:project.into(),model:model.into(),stage,progress,
         started_ms:now-mins*60_000,updated_ms:now-30_000,turn_ms:mins*60_000,output_tokens:41230,rate:96.4,log:None};
     h.app.task.inject(vec![
         item("dsh:1",Source::Dsh,"把任务进度搬上岛","Daozai_fork","deepseek-v4.1-flash",Stage::WaitingApproval,Some(0.62),12),
@@ -9437,6 +9441,37 @@ fn scrolling_through_pages_keeps_the_clock_from_jumping(){
     for _ in 0..40{h.frame(vec![]);lowest=lowest.min(h.app.header_m);}
     assert!(lowest>0.999,"快速换页时顶栏布局不该回退（最低 {lowest}）");
 }
+#[test]
+fn finished_task_raises_a_clickable_banner(){
+    use crate::app::Cmd;
+    use crate::task_scan::{Source,Stage,TaskItem};
+    let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let item=|stage:Stage|TaskItem{id:"dsh:banner".into(),parent:None,source:Source::Dsh,title:"整理下载中心的来源".into(),
+        project:"daozai".into(),model:"deepseek-v4.1-flash".into(),stage,progress:None,
+        started_ms:now-120_000,updated_ms:now-1_000,turn_ms:119_000,output_tokens:1024,rate:150.0,log:None};
+    // 先有一条在跑的任务：首轮只记账，不能把「本来就在跑」当成「刚完成」报出来。
+    h.app.task.inject(vec![item(Stage::Tool)]);
+    for _ in 0..4{h.frame(vec![]);}
+    assert!(!h.app.task_banner_shown(),"刚启动不该弹完成横幅");
+    // 同一条任务收场：岛下应该冒出一条可点的横幅。
+    h.app.task.inject(vec![item(Stage::Done)]);
+    for _ in 0..4{h.frame(vec![]);}
+    assert!(h.app.task_banner_shown(),"任务完成后没有横幅");
+    let rect=h.ctx.read_response(egui::Id::new(("card",true,"task-banner")))
+        .or_else(||h.ctx.read_response(egui::Id::new(("card",false,"task-banner"))))
+        .expect("横幅要能点").rect;
+    let pos=rect.center();
+    h.cmds.clear();
+    h.cursor=Some(pos);
+    h.frame(vec![egui::Event::PointerMoved(pos)]);
+    h.frame(vec![egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:true,modifiers:Default::default()}]);
+    h.frame(vec![egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:false,modifiers:Default::default()}]);
+    assert!(h.cmds.iter().any(|cmd|matches!(cmd,Cmd::OpenTask(Source::Dsh,_))),"点横幅没有回到那个客户端：{:?} @{pos:?}",h.cmds);
+    assert!(!h.app.task_banner_shown(),"点过之后横幅应该退场");
+}
+
 #[test]
 fn right_click_dismisses_an_unconfirmed_reminder(){
     use crate::app::{Cmd,Messenger,Unread};

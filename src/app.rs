@@ -51,11 +51,11 @@ pub const BAR_H_MIN: f32 = 4.5;
 /// 有任务时收起药丸要额外撑开的宽度，给岛上角标 `[环][173 t/s]` 腾位置。
 /// 药丸平时只包住常驻内容（电池/宠物/时钟），左右各只剩 16 点，角标挤不进去；
 /// 撑开量平分到两侧，所以这里约等于「角标宽度 × 2」。
-pub(crate) const ISLAND_BADGE_W: f32 = 96.0;
+pub(crate) const ISLAND_BADGE_W: f32 = 76.0;
 /// 只画进度环（不开速度）时的撑开量。
-pub(crate) const ISLAND_BADGE_RING_W: f32 = 24.0;
+pub(crate) const ISLAND_BADGE_GAP: f32 = 8.0;
 /// 只画速度文字（不开进度环）时的撑开量：省掉环占的 11 点，字照旧放得下。
-pub(crate) const ISLAND_BADGE_TEXT_W: f32 = 64.0;
+
 pub const FLARE: f32 = 17.6; // 顶部外翻肩宽
 pub const FLARE_H: f32 = 16.0; // 外翻收敛高度
 pub const RAD: f32 = 33.0; // 底部圆角
@@ -198,6 +198,8 @@ pub enum Cmd {
     /// AI 任务行被点开：回到那个客户端（DSH 就是 DeepSeek Harness 窗口），
     /// 日志路径只作为「找不到窗口」时的兜底。
     OpenTask(crate::task_scan::Source, Option<PathBuf>),
+    /// 父任务行右侧的「▸ N 个子任务」被点：展开/收起它名下的子 agent 会话。
+    ToggleTaskFold(String),
     Copy(String),
     Notify(String, String, NotificationSound),
     RequestNotifications,
@@ -721,6 +723,16 @@ const CENTER_SWEEP: f64 = 0.55;
 /// 已居中的提示色（绿）：岛体描边、外发光和扫光统一用它，颜色本身就是「对准了」。
 const CENTER_TINT: (f32, f32, f32) = (88.0, 222.0, 140.0);
 
+/// 收起态岛下的「会话完成」横幅：点一下跳到对应客户端，十秒后自己退场。
+#[derive(Clone, Debug)]
+pub(crate) struct TaskBanner {
+    pub id: String,
+    pub title: String,
+    pub source: crate::task_scan::Source,
+    pub log: Option<PathBuf>,
+    pub at: f64,
+}
+
 pub struct App {
     pub opts: Options,
     pub settings: model::Settings,
@@ -918,6 +930,14 @@ pub struct App {
     pub(crate) resident_power: (Option<u8>,bool),
     /// AI 任务页：后台扫描本机 Codex / Claude / DeepSeek 会话的进度。
     pub(crate) task: crate::task_scan::Watcher,
+    /// 已经被点开、正在展开显示子 agent 的父任务 id（默认折叠）。
+    pub(crate) task_expanded: Vec<String>,
+    /// 岛下那条完成横幅：一次显示一条，点过或十秒后退场。
+    pub(crate) task_banner: Option<TaskBanner>,
+    pub(crate) task_banner_queue: Vec<TaskBanner>,
+    /// 报过完成的会话（id → 毫秒时间）：第一次扫描只记账不弹，避免历史完成全涌上来。
+    pub(crate) task_banner_done: Vec<(String, i64)>,
+    pub(crate) task_banner_primed: bool,
 }
 
 impl App {
@@ -1054,6 +1074,11 @@ impl App {
             updates: crate::updates::State::load(model::config_dir().join("update-check.json")),
             resident: Default::default(), resident_power:(None,false),
             task: crate::task_scan::Watcher::new(),
+            task_expanded: Vec::new(),
+            task_banner: None,
+            task_banner_queue: Vec::new(),
+            task_banner_done: Vec::new(),
+            task_banner_primed: false,
         }
     }
 
@@ -1799,15 +1824,22 @@ impl App {
     /// 药丸平时只包住常驻内容（左右各 16 点），所以留的位置要按角标宽度加倍（平分到两侧）。
     fn island_badge_reserve(&self)->f32 {
         if self.open || self.effective_minimal() {return 0.0;}
-        if !(self.settings.task_island_speed||self.settings.task_island_progress) {return 0.0;}
-        let Some(badge)=self.island_badge() else {return 0.0;};
-        let ring=badge.progress.is_some()&&self.settings.task_island_progress;
-        let speed=badge.rate>=1.0&&self.settings.task_island_speed;
-        match (ring,speed) {
-            (true,true)=>ISLAND_BADGE_W,
-            (false,true)=>ISLAND_BADGE_TEXT_W,
-            (true,false)=>ISLAND_BADGE_RING_W,
-            (false,false)=>0.0,
+        // 只按「这一帧真的有文字要画」预留：宽度固定，配平交给下面的位移。
+        let Some(text)=self.island_badge_text() else {return 0.0;};
+        // 只多留「这一段字 + 一点边距」的宽度，再多就只是白边了。
+        text.chars().count() as f32 * 5.2 + ISLAND_BADGE_GAP
+    }
+    /// 自检用：现在岛上有没有正在显示的「会话完成」横幅。
+    pub fn task_banner_shown(&self)->bool {self.task_banner.is_some()}
+    /// 父任务名下的子 agent 会话是不是被展开了（默认折叠）。
+    pub fn task_fold_open(&self, id: &str) -> bool {
+        self.task_expanded.iter().any(|open| open == id)
+    }
+    pub fn toggle_task_fold(&mut self, id: &str) {
+        if let Some(index) = self.task_expanded.iter().position(|open| open == id) {
+            self.task_expanded.remove(index);
+        } else {
+            self.task_expanded.push(id.to_string());
         }
     }
     fn lyric_focus_space(&self)->f32 {if self.pomo.running{crate::focus_bar::LYRIC_WIDTH+10.0}else{0.0}}
@@ -1877,6 +1909,7 @@ impl App {
         self.weather_tick();
         self.task_tick();
         self.task_island_tick();
+        self.task_banner_tick();
         self.current_hour=env.hour();
         self.system_idle=env.idle_seconds;
         self.dt = dt;
@@ -2214,6 +2247,9 @@ impl App {
             } else {origin};
             self.toast_layer(&Card::new(ui,toast_origin,win),h+8.0)
         }else{None};
+        // 会话完成横幅：和岛下提示同一位置，但它是可以点的（点了回到那个客户端）。
+        // 岛体贴着屏幕顶端时上方没有空间，所以横幅只能排在药丸下方。
+        let task_banner=self.task_banner_layer(&Card::new(ui,origin,win),h+8.0+if floating_toast.is_some(){26.0}else{0.0},&mut cmds);
         if (self.adding||self.editing.is_some()) && reveal > 0.9 && self.page == 4 && self.page_e() > 0.25 {
             self.input_field(ui, origin, &mut cmds);
         }
@@ -2277,6 +2313,7 @@ impl App {
                 shapes.push(GlassShape::Round(rel(r),radius));
             }
             if let Some(r)=floating_toast {shapes.push(GlassShape::Round(rel(r),11.0));}
+            if let Some(r)=task_banner {shapes.push(GlassShape::Round(rel(r),12.0));}
             shapes.extend(tooltips.iter().map(|r|GlassShape::Round(rel(*r),6.0)));
             shapes
         });
@@ -2330,12 +2367,12 @@ impl App {
             });
         }
         FrameOut {
-            region: rel(floating_toast.into_iter().chain(self.shelf_menu_rect.map(|r|r.union(r + ctx.style().visuals.popup_shadow.margin()).expand(1.0 / ctx.pixels_per_point()))).fold(region,Rect::union).intersect(ui.max_rect())),
+            region: rel(floating_toast.into_iter().chain(task_banner).chain(self.shelf_menu_rect.map(|r|r.union(r + ctx.style().visuals.popup_shadow.margin()).expand(1.0 / ctx.pixels_per_point()))).fold(region,Rect::union).intersect(ui.max_rect())),
             glass: glass_region,
             hit: rel(next_hit),
             page_scroll_area:self.page_scroll_area.map(rel),
             click_through: minimal_strip && !self.open && self.position_drag.is_none(),
-            notice_hit:notice_shape.into_iter().chain(notice_details).chain(messenger_rect).chain(self.shelf_menu_rect).reduce(|a,b|a.union(b)).map(rel),
+            notice_hit:notice_shape.into_iter().chain(task_banner).chain(notice_details).chain(messenger_rect).chain(self.shelf_menu_rect).reduce(|a,b|a.union(b)).map(rel),
             file_drop_zone:self.settings.visible_pages[3].then(||rel(if side {self.island_rect(win,PW,self.expanded_height())} else {Rect::from_min_size(Pos2::new(cx-PW/2.0,top),Vec2::new(PW,96.0))})),
             expanded: self.open,
             editing: self.is_editing(),
@@ -3002,11 +3039,24 @@ impl App {
         let hb = (gx + 8.5, 18.6);
         let hd = gx + battery_space;
         let hc = hd + date_w + 8.0;
+        // 收起态岛角标：文字只在「收起、非极简、歌词/通知没占着药丸」时出现。
+        let badge_quiet = lyric_alpha <= 0.003
+            && !self.island_lyrics_active()
+            && self.notice.is_none()
+            && !self.hud_notice.as_ref().is_some_and(|a| a.is_hud());
+        // 展开以后顶栏是「日期 + 时钟」那一套，收起态角标必须退场，否则会压到日期上。
+        let badge_text = if badge_quiet && !self.open && !self.effective_minimal() { self.island_badge_text() } else { None };
+        let badge_side_right = self.settings.task_badge_side == 1;
         // 药丸起点布局
         let has_music=self.media.is_music();
         let layout=self.resident.current();
-        let pb=(local_cx+layout.x[bar::BATTERY].unwrap_or(0.0),15.0);
-        let pcx=layout.x[bar::CLOCK].map_or(hc,|x|local_cx+x-paint::clock_width(base,&clock,size::PILL_CLOCK)/2.0);
+        // 角标占左侧（或右侧）那一段，把常驻内容整体往反方向挪半个预留宽度，
+        // 这样药丸两端的边距才一样宽，不会一边贴着图标、一边空一大块。
+        let badge_shift = if badge_text.is_some() {let half=self.island_badge_reserve()/2.0; if badge_side_right {-half} else {half}} else {0.0};
+        let pill_cx = local_cx + badge_shift;
+        let pill_w = layout.width + self.island_badge_reserve();
+        let pb=(pill_cx+layout.x[bar::BATTERY].unwrap_or(0.0),15.0);
+        let pcx=layout.x[bar::CLOCK].map_or(hc,|x|pill_cx+x-paint::clock_width(base,&clock,size::PILL_CLOCK)/2.0);
 
         if self.effective_minimal() && self.t>=self.notification_bell_until && p < 0.02 { return; }
         // 电池：位置/大小连续插值
@@ -3024,44 +3074,19 @@ impl App {
         if a_head > 0.0 {
             paint::clock(&base.faded(a_head),cpos.0,cpos.1-0.5,&clock,size::CLOCK);
         }
-        // 收起态岛角标：当前 AI 任务的 token 速度 + 完成进度（`[环][173 t/s]`）。
-        // 只在收起、非极简、对应设置打开时画；展开后任务页本身有更完整的呈现。
-        // 歌词占着药丸（它比常驻内容宽得多）时不画：那会儿药丸的左边缘是封面和歌词，
-        // 角标压上去只会糊成一片，等歌词退场自然就回来了。
-        let badge_quiet = lyric_alpha <= 0.003
-            && !self.island_lyrics_active()
-            && self.notice.is_none()
-            && !self.hud_notice.as_ref().is_some_and(|a| a.is_hud());
-        if self.island_badge_reserve() > 0.0 && badge_quiet {
-            if let Some(badge)=self.island_badge() {
-                let ring_r=5.5;
-                let rate=self.settings.task_island_speed && badge.rate>=1.0;
-                let text=if rate {
-                    if badge.rate>=1000.0 {format!("{:.1}k t/s",badge.rate/1000.0)}else{format!("{:.0} t/s",badge.rate)}
-                } else {String::new()};
-                let progress=self.settings.task_island_progress.then_some(badge.progress).flatten();
-                // 右对齐贴在常驻内容左边：常驻布局以药丸中心居中，它的墨水从
-                // `local_cx - layout.width/2 + 16` 起排（16 是布局自带的内边距）。
-                // 预留出来的那点宽度由中心平分，所以从这条墨水线往回排一定落在空地。
-                // 文字用右对齐锚（不靠量出来的宽度定位）：量宽和实际的字形宽度差一两个点
-                // 也只会把环推歪一点，不会让字压到电池/时钟上。
-                let ink_left=local_cx-layout.width/2.0+16.0;
-                let anchor=ink_left-8.0;
-                if rate {
-                    base.text(anchor,18.6,&text,9.5,W::Regular,theme::GRAY,H::Right);
-                }
-                if let Some(progress)=progress {
-                    let ring_x=anchor-base.text_w(&text,9.5,W::Regular)-4.0-ring_r*2.0;
-                    let center=(ring_x+ring_r,BAR_H/2.0);
-                    base.ring(center.0,center.1,ring_r,2.0,theme::DIM);
-                    let sweep=progress.clamp(0.0,1.0);
-                    if sweep>0.002 {
-                        base.arc(center.0,center.1,ring_r,-FRAC_PI_2,-FRAC_PI_2+TAU*sweep,2.0,theme::SOFT_GREEN);
-                    }
-                }
-                // 速度会随 token 继续涨：一秒重画一次就够，别为了角标整岛狂转。
-                base.ui.ctx().request_repaint_after(std::time::Duration::from_millis(1000));
+        // 收起态岛角标：全岛总 token 速度 +（可选）当前任务的完成百分比。
+        // 不画圆环：有的会话有进度、有的没有，环时有时无反而更乱；百分比用文字说清楚。
+        if let Some(text)=&badge_text {
+            // `layout.x[]` 是从常驻内容**左边缘**量的中心点，所以内容占 [pill_cx, pill_cx+width]：
+            // 角标贴在内容外 8 点，左边那份右对齐到内容左边缘，右边那份左对齐到内容右边缘。
+            // 贴药丸内侧画：两端边距都是 10 点，角标只在它那一侧多占一段。
+            if badge_side_right {
+                base.text(local_cx + pill_w/2.0 - 10.0,18.6,text,9.5,W::Regular,theme::GRAY,H::Right);
+            } else {
+                base.text(local_cx - pill_w/2.0 + 10.0,18.6,text,9.5,W::Regular,theme::GRAY,H::Left);
             }
+            // 速度会随 token 继续涨：一秒重画一次就够，别为了角标整岛狂转。
+            base.ui.ctx().request_repaint_after(std::time::Duration::from_millis(1000));
         }
         // 日期随内容淡入，从药丸方向轻轻滑出
         if reveal > 0.0 {
@@ -3285,6 +3310,67 @@ impl App {
             CALENDAR_PAGE => self.page_calendar(c,env),
             _ => self.page_settings(c),
         }
+    }
+
+    /// 扫一遍任务列表，把「刚从在跑变成收场」的会话排进完成横幅队列。
+    /// 第一次只记账不弹：进程刚起来时列表里全是历史完成，一股脑弹出来只会成为噪音。
+    fn task_banner_tick(&mut self) {
+        let now_ms = (self.t * 1000.0) as i64;
+        let terminal: Vec<(String, String, crate::task_scan::Source, Option<PathBuf>)> = self.task.items().iter()
+            .filter(|task| task.stage.terminal())
+            .map(|task| (task.id.clone(), task.title.clone(), task.source, task.log.clone()))
+            .collect();
+        if !self.task_banner_primed {
+            self.task_banner_primed = true;
+            for (id, _, _, _) in &terminal {
+                self.task_banner_done.push((id.clone(), now_ms));
+            }
+            return;
+        }
+        // 报过的记录留 30 分钟就够：再久也不会有人回头看那条横幅。
+        self.task_banner_done.retain(|(_, at)| now_ms - *at < 30 * 60 * 1000);
+        let mut fresh: Vec<TaskBanner> = Vec::new();
+        for (id, title, source, log) in terminal {
+            if self.task_banner_done.iter().any(|(seen, _)| seen == &id) { continue; }
+            if self.task_banner_queue.iter().any(|banner| banner.id == id) { continue; }
+            if self.task_banner.as_ref().is_some_and(|banner| banner.id == id) { continue; }
+            fresh.push(TaskBanner { id, title, source, log, at: self.t });
+        }
+        for banner in fresh {
+            self.task_banner_done.push((banner.id.clone(), now_ms));
+            self.task_banner_queue.push(banner);
+        }
+        if self.task_banner.is_none() && !self.task_banner_queue.is_empty() {
+            // 先完成的先报，排队的一条一条来。
+            self.task_banner = Some(self.task_banner_queue.remove(0));
+        }
+    }
+
+    /// 岛下的完成横幅：一条可点的卡片，十秒后自己退场。
+    fn task_banner_layer(&mut self, c: &Card, base_y: f32, cmds: &mut Vec<Cmd>) -> Option<Rect> {
+        let banner = self.task_banner.clone()?;
+        let e = (self.t - banner.at) as f32;
+        if e > 10.0 {
+            self.task_banner = None;
+            return None;
+        }
+        let a = smoothstep(0.0, 0.16, e) * (1.0 - smoothstep(9.4, 10.0, e));
+        let rise = (1.0 - anim::ease_out_cubic(e / 0.3)) * 6.0;
+        let msg = c.fit(&format!("「{}」已完成 · 点这里打开", banner.title), size::BODY, W::Regular, 300.0);
+        let w = c.text_w(&msg, size::BODY, W::Regular) + 30.0;
+        let tc = c.faded(a);
+        let y = base_y + rise;
+        let response = tc.hit(PW / 2.0 - w / 2.0, y, w, 24.0, "task-banner").on_hover_text("回到那个客户端");
+        tc.fill(PW / 2.0 - w / 2.0, y, w, 24.0, 12.0, Color32::from_rgb(44, 44, 48));
+        tc.text(PW / 2.0, y + 16.0, &msg, size::BODY, W::Regular, theme::WHITE, H::Center);
+        if response.clicked() {
+            cmds.push(Cmd::OpenTask(banner.source, banner.log.clone()));
+            self.task_banner = None;
+        } else if self.task_banner.is_some() {
+            // 退场的那一下要画出来，否则它会「突然消失」。
+            c.ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        }
+        Some(tc.rect(PW / 2.0 - w / 2.0, y, w, 24.0))
     }
 
     fn toast_layer(&mut self, c: &Card, base_y:f32)->Option<Rect> {
