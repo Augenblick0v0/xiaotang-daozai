@@ -62,6 +62,8 @@ pub mod layered;
 pub mod system;
 pub mod paint;
 pub mod qq_toast;
+pub mod task_scan;
+mod task_ui;
 pub mod shape;
 mod fluid;
 pub mod smtc;

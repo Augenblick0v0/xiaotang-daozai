@@ -216,8 +216,8 @@ pub struct Settings {
     pub browser_minimal: bool,
     pub avoid_browsers: bool,
     pub avoid_apps: Vec<(String,String)>,
-    pub visible_pages: [bool; 9],
-    pub page_order: [usize; 9],
+    pub visible_pages: [bool; 10],
+    pub page_order: [usize; 10],
     pub show_clock: bool,
     pub show_battery: bool,
     pub show_weather: bool,
@@ -287,11 +287,17 @@ pub struct Settings {
     pub render_compat: bool,
     /// 自动切换到兼容渲染的原因；手动开启时为空。
     pub render_compat_reason: String,
+    /// AI 任务页：Dsh / Codex / Claude 三个来源各扫不扫。
+    pub task_sources: [bool; 3],
+    /// AI 任务页：最近多少分钟内有活动才显示。
+    pub task_keep_minutes: u32,
+    /// AI 任务页：共享屏幕时隐藏项目名。
+    pub task_hide_project: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 9], page_order: [0,1,2,3,4,5,6,7,8], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, qq_avatar:true, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new() }
+        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, qq_avatar:true, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), task_sources: [true;3], task_keep_minutes: 30, task_hide_project: false }
     }
 }
 
@@ -353,12 +359,17 @@ impl Settings {
                 }
                 "page_order" => {
                     if let Ok(order)=v.split(',').map(str::parse::<usize>).collect::<Result<Vec<_>,_>>() {
-                        if order.len()==9 && (0..9).all(|page|order.contains(&page)) {
+                        if order.len()==10 && (0..10).all(|page|order.contains(&page)) {
                             s.page_order.copy_from_slice(&order);
+                        } else if order.len()==9 && (0..9).all(|page|order.contains(&page)) {
+                            // 旧配置里没有 AI 任务页：接在最后，其余顺序保持不变。
+                            s.page_order[..9].copy_from_slice(&order);
+                            s.page_order[9]=9;
                         } else if order.len()==8 && (0..8).all(|page|order.contains(&page)) {
                             // 旧配置里没有天气页：接在最后，其余顺序保持不变。
                             s.page_order[..8].copy_from_slice(&order);
                             s.page_order[8]=8;
+                            s.page_order[9]=9;
                         }
                     }
                 }
@@ -368,7 +379,7 @@ impl Settings {
                 "show_battery" => s.show_battery = v != "0",
                 "show_clock" => s.show_clock = v != "0",
                 "show_weather" => s.show_weather = v != "0",
-                "visible_pages" if (6..=9).contains(&v.len()) && v.bytes().all(|b| b==b'0' || b==b'1') => {
+                "visible_pages" if (6..=10).contains(&v.len()) && v.bytes().all(|b| b==b'0' || b==b'1') => {
                     for (enabled,value) in s.visible_pages.iter_mut().zip(v.bytes()) { *enabled=value==b'1'; }
                     for enabled in &mut s.visible_pages[v.len()..]{*enabled=v.bytes().any(|b|b==b'1');}
                 }
@@ -381,6 +392,11 @@ impl Settings {
                 "qq_only" => s.qq_only=v=="1",
                 "notification_preview" => s.notification_preview=v=="1",
         "qq_avatar" => s.qq_avatar=v=="1",
+                "task_sources" if v.len()==3 && v.bytes().all(|b|b==b'0'||b==b'1') => {
+                    for (enabled,value) in s.task_sources.iter_mut().zip(v.bytes()) { *enabled=value==b'1'; }
+                }
+                "task_keep_minutes" => s.task_keep_minutes = v.parse::<u32>().ok().filter(|v|[5,15,30,60,240].contains(v)).unwrap_or(30),
+                "task_hide_project" => s.task_hide_project = v=="1",
                 "system_hud" => s.system_hud = v != "0",
                 "bluetooth_notifications" => s.bluetooth_notifications = v != "0",
                 "notifications" => s.notifications = v != "0",
@@ -466,6 +482,9 @@ impl Settings {
                 ("qq_only".into(),(self.qq_only as u8).to_string()),
                 ("notification_preview".into(),(self.notification_preview as u8).to_string()),
             ("qq_avatar".into(),(self.qq_avatar as u8).to_string()),
+                ("task_sources".into(), self.task_sources.iter().map(|enabled|if *enabled {'1'}else{'0'}).collect()),
+                ("task_keep_minutes".into(), self.task_keep_minutes.to_string()),
+                ("task_hide_project".into(), (self.task_hide_project as u8).to_string()),
                 ("system_hud".into(), (self.system_hud as u8).to_string()),
                 ("bluetooth_notifications".into(), (self.bluetooth_notifications as u8).to_string()),
                 ("notifications".into(), (self.notifications as u8).to_string()),
