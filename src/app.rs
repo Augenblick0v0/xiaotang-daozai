@@ -17,6 +17,7 @@ use crate::smtc::{NowPlaying, Transport};
 use crate::theme::{self, size, W};
 use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
 use std::collections::HashMap;
+use std::f32::consts::{FRAC_PI_2, TAU};
 use std::path::PathBuf;
 
 // ---------- 几何（逻辑点；原版 125% 截图 ÷ 1.25） ----------
@@ -47,6 +48,14 @@ pub(crate) const HUD_TRACK_X: f32 = 48.0;
 pub(crate) const HUD_TRACK_W: f32 = 150.0;
 pub const BAR_W_MIN: f32 = 44.0; // 极简小条
 pub const BAR_H_MIN: f32 = 4.5;
+/// 有任务时收起药丸要额外撑开的宽度，给岛上角标 `[环][173 t/s]` 腾位置。
+/// 药丸平时只包住常驻内容（电池/宠物/时钟），左右各只剩 16 点，角标挤不进去；
+/// 撑开量平分到两侧，所以这里约等于「角标宽度 × 2」。
+pub(crate) const ISLAND_BADGE_W: f32 = 96.0;
+/// 只画进度环（不开速度）时的撑开量。
+pub(crate) const ISLAND_BADGE_RING_W: f32 = 24.0;
+/// 只画速度文字（不开进度环）时的撑开量：省掉环占的 11 点，字照旧放得下。
+pub(crate) const ISLAND_BADGE_TEXT_W: f32 = 64.0;
 pub const FLARE: f32 = 17.6; // 顶部外翻肩宽
 pub const FLARE_H: f32 = 16.0; // 外翻收敛高度
 pub const RAD: f32 = 33.0; // 底部圆角
@@ -186,6 +195,9 @@ pub enum Cmd {
     /// 需要键盘输入：外壳应让窗口可激活并取得焦点。
     Focus,
     Reveal(PathBuf),
+    /// AI 任务行被点开：回到那个客户端（DSH 就是 DeepSeek Harness 窗口），
+    /// 日志路径只作为「找不到窗口」时的兜底。
+    OpenTask(crate::task_scan::Source, Option<PathBuf>),
     Copy(String),
     Notify(String, String, NotificationSound),
     RequestNotifications,
@@ -1783,6 +1795,21 @@ impl App {
     pub(crate) fn effective_minimal(&self)->bool {self.settings.minimal || self.browser_minimal_active}
     pub(crate) fn pet_enabled(&self)->bool {self.settings.pet && !self.effective_minimal() && !self.side()}
     pub(crate) fn pet_space(&self)->f32 {if self.pet_enabled(){44.0}else{0.0}}
+    /// 收起态岛角标要不要画、药丸要不要给它留位置：都按「这一帧真会画什么」算。
+    /// 药丸平时只包住常驻内容（左右各 16 点），所以留的位置要按角标宽度加倍（平分到两侧）。
+    fn island_badge_reserve(&self)->f32 {
+        if self.open || self.effective_minimal() {return 0.0;}
+        if !(self.settings.task_island_speed||self.settings.task_island_progress) {return 0.0;}
+        let Some(badge)=self.island_badge() else {return 0.0;};
+        let ring=badge.progress.is_some()&&self.settings.task_island_progress;
+        let speed=badge.rate>=1.0&&self.settings.task_island_speed;
+        match (ring,speed) {
+            (true,true)=>ISLAND_BADGE_W,
+            (false,true)=>ISLAND_BADGE_TEXT_W,
+            (true,false)=>ISLAND_BADGE_RING_W,
+            (false,false)=>0.0,
+        }
+    }
     fn lyric_focus_space(&self)->f32 {if self.pomo.running{crate::focus_bar::LYRIC_WIDTH+10.0}else{0.0}}
     fn lyric_bar_width(&self)->f32 {LYRIC_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()}
     fn notice_size(&self,a:&Alert)->(f32,f32) {
@@ -1808,7 +1835,9 @@ impl App {
         } else if self.effective_minimal()&&self.t>=self.notification_bell_until {
             (BAR_W_MIN, BAR_H_MIN)
         } else {
-            (self.resident.target.width.min(WIN_W-32.0), BAR_H)
+            // 有任务角标时药丸撑开一点：药丸只包住常驻内容，不预留就画不进 `[环][173 t/s]`。
+            // 撑开量平分到两侧（内容仍居中），所以留的是角标宽度的两倍。
+            ((self.resident.target.width+self.island_badge_reserve()).min(WIN_W-32.0), BAR_H)
         }
     }
 
@@ -1847,6 +1876,7 @@ impl App {
         self.quota_tick();
         self.weather_tick();
         self.task_tick();
+        self.task_island_tick();
         self.current_hour=env.hour();
         self.system_idle=env.idle_seconds;
         self.dt = dt;
@@ -2993,6 +3023,39 @@ impl App {
         }
         if a_head > 0.0 {
             paint::clock(&base.faded(a_head),cpos.0,cpos.1-0.5,&clock,size::CLOCK);
+        }
+        // 收起态岛角标：当前 AI 任务的 token 速度 + 完成进度（`[环][173 t/s]`）。
+        // 只在收起、非极简、对应设置打开时画；展开后任务页本身有更完整的呈现。
+        if self.island_badge_reserve() > 0.0 {
+            if let Some(badge)=self.island_badge() {
+                // 从药丸左边距 8 点起步往右排：环在左、字在右。
+                let left=local_cx-self.w.pos/2.0+8.0;
+                let ring_r=5.5;
+                let mut x=left;
+                if self.settings.task_island_progress {
+                    if let Some(progress)=badge.progress {
+                        let center=(x+ring_r,BAR_H/2.0);
+                        base.ring(center.0,center.1,ring_r,2.0,theme::DIM);
+                        let sweep=progress.clamp(0.0,1.0);
+                        if sweep>0.002 {
+                            base.arc(center.0,center.1,ring_r,-FRAC_PI_2,-FRAC_PI_2+TAU*sweep,2.0,theme::SOFT_GREEN);
+                        }
+                        x+=ring_r*2.0+4.0;
+                    }
+                }
+                if self.settings.task_island_speed && badge.rate>=1.0 {
+                    let rate=if badge.rate>=1000.0 {format!("{:.1}k t/s",badge.rate/1000.0)}else{format!("{:.0} t/s",badge.rate)};
+                    // 常驻内容以药丸中心居中，最左边那个槽的墨水从 `local_cx - layout.width/2 + 16` 起排
+                    // （16 是布局自带的左右内边距）：字一旦要越过这条线就只留环，
+                    // 宁可少显示一样，也别把岛上的常驻信息糊了。
+                    let limit=local_cx-layout.width/2.0+16.0-3.0;
+                    if x+base.text_w(&rate,9.5,W::Regular)<=limit {
+                        base.text(x,18.6,&rate,9.5,W::Regular,theme::GRAY,H::Left);
+                    }
+                }
+                // 速度会随 token 继续涨：一秒重画一次就够，别为了角标整岛狂转。
+                base.ui.ctx().request_repaint_after(std::time::Duration::from_millis(1000));
+            }
         }
         // 日期随内容淡入，从药丸方向轻轻滑出
         if reveal > 0.0 {
