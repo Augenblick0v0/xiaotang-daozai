@@ -148,8 +148,6 @@ fn playback(process:&Process,target:Target,cursor:&mut usize)->Option<(String,u6
     }
     None
 }
-
-#[link(name="winsqlite3")]
 extern "C" {
     fn sqlite3_open_v2(name:*const c_char,db:*mut *mut c_void,flags:i32,vfs:*const c_char)->i32;
     fn sqlite3_close(db:*mut c_void)->i32;

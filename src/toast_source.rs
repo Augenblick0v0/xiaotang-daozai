@@ -1,7 +1,6 @@
 //! 仅在通知缺少应用标识时，按编号和创建时间核对 Windows 记录的发送方；不查询通知正文。
 use std::{ffi::{c_char,c_int,c_void,CStr,CString},path::Path,ptr};
 type RowCallback=unsafe extern "C" fn(*mut c_void,c_int,*mut *mut c_char,*mut *mut c_char)->c_int;
-#[link(name="winsqlite3")]
 extern "C" {
     fn sqlite3_open_v2(name:*const c_char,db:*mut *mut c_void,flags:c_int,vfs:*const c_char)->c_int;
     fn sqlite3_exec(db:*mut c_void,sql:*const c_char,callback:Option<RowCallback>,data:*mut c_void,error:*mut *mut c_char)->c_int;

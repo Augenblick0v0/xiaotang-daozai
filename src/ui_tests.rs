@@ -728,8 +728,8 @@ fn v0649_settings_and_mail_accounts_survive_upgrade(){
         crate::model::Settings::load().save();
         let saved=std::fs::read_to_string(directory.join("settings.txt")).unwrap();
         for line in legacy.lines().filter(|line|!line.starts_with("visible_pages=")&&!line.starts_with("page_order=")){assert!(saved.lines().any(|value|value==line),"升级保存不能改变旧设置：{line}");}
-        assert!(saved.lines().any(|value|value=="visible_pages=1011111111"),"旧页面开关应保留，并默认开启天气页与 AI 任务页");
-        assert!(saved.lines().any(|value|value=="page_order=5,2,0,1,3,4,6,7,8,9"),"旧顺序应保留，并把天气页、AI 任务页接在最后");
+        assert!(saved.lines().any(|value|value=="visible_pages=10111111111"),"旧页面开关应保留，并默认开启天气页、AI 任务页与下载页");
+        assert!(saved.lines().any(|value|value=="page_order=5,2,0,1,3,4,6,7,8,9,10"),"旧顺序应保留，并把天气页、AI 任务页、下载页接在最后");
     }
     std::fs::write(directory.join("mail-accounts.json"),br#"[{"email":"OldUser@qq.com","provider":"qq","enabled":true},{"email":"old@icloud.com","provider":"icloud","enabled":false}]"#).unwrap();
     let accounts=crate::mail::load_accounts();
@@ -1186,7 +1186,9 @@ impl H {
         let dir = std::env::temp_dir().join(format!("daozai-test-{}-{}", std::process::id(), rand_id()));
         std::env::set_var("DAOZAI_DATA_DIR", &dir);
         let ctx = egui::Context::default();
-        let app = App::new(&ctx, Options { fetch_lyrics: false, pet_idle: 1e9 });
+        let mut app = App::new(&ctx, Options { fetch_lyrics: false, pet_idle: 1e9 });
+        // 测试不扫本机真实下载器数据（IDM/FDM/Ghost 的内容因机器而异，且会让上岛卡片顶掉常驻入口）。
+        app.download.inject(Vec::new());
         Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,interactive_transition:false,shapes:Vec::new(), bt:Vec::new(),media:Default::default(),power:(None,false),network:None,system_idle:None,screen_locked:false,fullscreen:false,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
     }
     fn frame(&mut self, events: Vec<egui::Event>) {
@@ -2512,7 +2514,7 @@ fn minimal_hover_does_not_catch_tabs_during_collapse() {
 fn music_header_shortcut_returns_from_every_page_without_controlling_playback() {
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
     for playing in [true,false] {
-        let mut h=H::new();h.app.settings.page_order=[5,2,0,1,3,4,6,7,8,9];
+        let mut h=H::new();h.app.settings.page_order=[5,2,0,1,3,4,6,7,8,9,10];
         h.media=crate::smtc::NowPlaying{source:"cloudmusic.exe".into(),title:"Track".into(),artist:"Artist".into(),playing,duration:120.0,..Default::default()};
         for page in 1..crate::app::PAGE_NAMES.len() {
             h.app.show_page(page);h.hover(H::local(300.0,60.0),0.8);h.cmds.clear();
@@ -2567,7 +2569,7 @@ fn wheel_navigation_reaches_every_page_in_both_directions(){
     h.app.shelf.items.clear();h.app.todos.items.clear();
     h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
     h.hover(H::local(210.0,18.0),0.3);
-    for (delta,pages) in [(-40.0,[1,2,3,4,5,6,7,8,9,0]),(40.0,[9,8,7,6,5,4,3,2,1,0])] {
+    for (delta,pages) in [(-40.0,[1,2,3,4,5,6,7,8,9,10,0]),(40.0,[10,9,8,7,6,5,4,3,2,1,0])] {
         for page in pages {
             h.wheel(delta);
             assert_eq!(h.app.page,page,"滚轮翻页不能被空的置物架或待办卡住");
@@ -2827,9 +2829,9 @@ fn wheel_handles_small_deltas_without_skipping_pages_on_bursts(){
 }
 
 #[test]
-fn navigation_wraps_between_ten_pages_and_notification_settings_remain_accessible() {
+fn navigation_wraps_between_eleven_pages_and_notification_settings_remain_accessible() {
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
-    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);h.click(H::local(21.0,68.0));assert_eq!(h.app.page,9);
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);h.click(H::local(21.0,68.0));assert_eq!(h.app.page,10,"左箭头应绕到最后一页（下载页）");
     h.hover(H::local(300.0,60.0),0.8);h.click(H::local(398.0,88.0));assert_eq!(h.app.page,0);
     h.app.open_settings_category(3);assert!(h.app.settings_open);assert_eq!(h.app.settings_tab,6);
 }
@@ -3329,7 +3331,7 @@ fn quota_accounts_switch_independently_and_hide_with_the_page() {
 fn page_visibility_is_saved_and_sets_the_starting_page() {
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
     let mut h=H::new();
-    assert_eq!(h.app.settings.visible_pages,[true;10]);
+    assert_eq!(h.app.settings.visible_pages,[true;11]);
     assert!(h.app.settings.show_battery);
     h.app.settings.show_battery=false;
     h.app.set_page_visible(0,false);
@@ -3337,17 +3339,17 @@ fn page_visibility_is_saved_and_sets_the_starting_page() {
     h.app.settings.save();
     let settings=crate::model::Settings::load();
     assert!(!settings.show_battery);
-    assert_eq!(settings.visible_pages,[false,true,true,false,true,true,true,true,true,true]);
+    assert_eq!(settings.visible_pages,[false,true,true,false,true,true,true,true,true,true,true]);
     let restarted=App::new(&h.ctx,Options{fetch_lyrics:false,pet_idle:1e9});
     assert_eq!(restarted.page(),1);
     assert_eq!(restarted.settings.visible_pages,settings.visible_pages);
     assert!(!restarted.settings.show_battery);
     std::fs::write(crate::model::config_dir().join("settings.txt"),"visible_pages=000000\n").unwrap();
-    assert_eq!(crate::model::Settings::load().visible_pages,[true,false,false,false,false,false,false,false,false,false]);
+    assert_eq!(crate::model::Settings::load().visible_pages,[true,false,false,false,false,false,false,false,false,false,false]);
     std::fs::write(crate::model::config_dir().join("settings.txt"),"visible_pages=1000000\n").unwrap();
-    assert_eq!(crate::model::Settings::load().visible_pages,[true,false,false,false,false,false,false,true,true,true],"旧版页面开关应保留，并开启新增的日程页、天气页与 AI 任务页");
+    assert_eq!(crate::model::Settings::load().visible_pages,[true,false,false,false,false,false,false,true,true,true,true],"旧版页面开关应保留，并开启新增的日程页、天气页、AI 任务页与下载页");
     std::fs::write(crate::model::config_dir().join("settings.txt"),"visible_pages=invalid\n").unwrap();
-    assert_eq!(crate::model::Settings::load().visible_pages,[true;10]);
+    assert_eq!(crate::model::Settings::load().visible_pages,[true;11]);
 }
 
 #[test]
@@ -3387,7 +3389,8 @@ fn battery_module_can_disable_only_the_power_warning() {
 fn page_visibility_skips_hidden_pages_in_every_navigation_control() {
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
     let mut h=H::new();
-    for page in [1,3,4,6,7,8,9] {h.app.set_page_visible(page,false);}
+    // 下载页也一起隐藏：这个测试只验证「隐藏页会被跳过」，圆点数量与位置才稳定。
+    for page in [1,3,4,6,7,8,9,crate::app::DOWNLOAD_PAGE] {h.app.set_page_visible(page,false);}
     h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
     for expected in [2,5,0] {
         h.click(H::local(398.0,68.0));
@@ -3416,7 +3419,8 @@ fn page_visibility_moves_away_from_hidden_page_and_keeps_one_page() {
     h.app.set_page_visible(4,false);
     assert_eq!(h.app.page,0);
     assert!(!h.app.is_editing());
-    for page in [0,1,3,5,6,7,8,9] {h.app.set_page_visible(page,false);}
+    // 下载页也关掉，2 号页才是最后一个页面。
+    for page in [0,1,3,5,6,7,8,9,crate::app::DOWNLOAD_PAGE] {h.app.set_page_visible(page,false);}
     assert_eq!(h.app.page,2);
     h.app.set_page_visible(2,false);
     assert!(h.app.settings.visible_pages[2],"不能关闭最后一个页面");
@@ -6137,13 +6141,14 @@ fn calendar_sync_result_does_not_enqueue_another_sync() {
 fn page_order_persists_and_controls_navigation() {
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
     let mut h=H::new();
-    h.app.settings.page_order=[5,2,0,1,3,4,6,7,8,9];
+    h.app.settings.page_order=[5,2,0,1,3,4,6,7,8,9,10];
     h.app.settings.save();
     let settings=crate::model::Settings::load();
-    assert_eq!(settings.page_order,[5,2,0,1,3,4,6,7,8,9]);
+    assert_eq!(settings.page_order,[5,2,0,1,3,4,6,7,8,9,10]);
     let restarted=App::new(&h.ctx,Options{fetch_lyrics:false,pet_idle:1e9});
     assert_eq!(restarted.page(),5);
-    for page in [1,3,4,6,7,8,9] {h.app.set_page_visible(page,false);}
+    // 下载页一起隐藏：可见页仍是 0/2/5，走位与断言不变。
+    for page in [1,3,4,6,7,8,9,crate::app::DOWNLOAD_PAGE] {h.app.set_page_visible(page,false);}
     h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
     for expected in [5,2,0] {
         h.click(H::local(398.0,68.0));
@@ -6156,8 +6161,24 @@ fn page_order_persists_and_controls_navigation() {
     assert_eq!(h.app.page,5);
     for invalid in ["0,0,1,2,3,4,5,6","8,1,2,3,4,5,6,7","0,1","invalid"] {
         std::fs::write(crate::model::config_dir().join("settings.txt"),format!("page_order={invalid}\n")).unwrap();
-        assert_eq!(crate::model::Settings::load().page_order,[0,1,2,3,4,5,6,7,8,9]);
+        assert_eq!(crate::model::Settings::load().page_order,[0,1,2,3,4,5,6,7,8,9,10]);
     }
+}
+
+/// 旧配置只有 10 页顺序：升级后补上第 11 个位置（下载页），不重复也不丢页。
+#[test]
+fn old_ten_page_order_gains_the_download_page() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let _h=H::new();
+    let directory=crate::model::config_dir();
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("settings.txt"),"visible_pages=1011111111\npage_order=5,2,0,1,3,4,6,7,8,9\n").unwrap();
+    let upgraded=crate::model::Settings::load();
+    assert_eq!(upgraded.page_order,[5,2,0,1,3,4,6,7,8,9,10],"旧顺序应原样保留，下载页接在最后");
+    let mut sorted=upgraded.page_order.to_vec();sorted.sort();sorted.dedup();
+    assert_eq!(sorted.len(),crate::app::PAGE_NAMES.len(),"迁移后每个页面恰好出现一次");
+    assert!(upgraded.page_order.contains(&crate::app::DOWNLOAD_PAGE),"迁移后应包含下载页");
+    assert!(upgraded.visible_pages[crate::app::DOWNLOAD_PAGE],"旧配置里缺的页面开关默认打开");
 }
 
 #[test]
@@ -6183,9 +6204,9 @@ fn page_order_drag_applies_on_release_and_saves() {
     draw(&mut h,vec![egui::Event::PointerMoved(from),button(from,true)]);
     draw(&mut h,vec![egui::Event::PointerMoved(from+egui::vec2(0.0,10.0))]);
     draw(&mut h,vec![egui::Event::PointerMoved(to)]);
-    assert_eq!(h.app.settings.page_order,[0,1,2,3,4,5,6,7,8,9]);
+    assert_eq!(h.app.settings.page_order,[0,1,2,3,4,5,6,7,8,9,10]);
     draw(&mut h,vec![button(to,false)]);
-    assert_eq!(h.app.settings.page_order,[1,2,0,3,4,5,6,7,8,9]);
+    assert_eq!(h.app.settings.page_order,[1,2,0,3,4,5,6,7,8,9,10]);
     assert_eq!(crate::model::Settings::load().page_order,h.app.settings.page_order);
 }
 
@@ -9294,7 +9315,7 @@ fn background_services_follow_the_module_switch(){
 
 #[test]
 fn every_module_settings_tab_maps_to_its_page(){
-    let titles=["通用","音乐","专注","健康","待办","置物","消息提醒","邮箱","日程","关于","页面管理","AI 额度","天气","外观","位置","AI 任务"];
+    let titles=["通用","音乐","专注","健康","待办","置物","消息提醒","邮箱","日程","关于","页面管理","AI 额度","天气","外观","位置","AI 任务","下载"];
     let mut pages:Vec<_>=(0..titles.len()).filter_map(crate::extras::settings_tab_module).collect();
     for tab in 0..titles.len() {
         if let Some(page)=crate::extras::settings_tab_module(tab) {assert!(crate::app::PAGE_NAMES[page].chars().next()==titles[tab].chars().next(),"{} ↔ {}",titles[tab],crate::app::PAGE_NAMES[page]);}
@@ -9335,6 +9356,126 @@ fn ai_task_page_renders_and_maps_to_its_settings_tab(){
     for want in ["AI 任务","任务来源","DeepSeek Harness","Codex CLI","Claude Code"]{
         assert!(texts.iter().any(|t|t==want),"设置分页 15 里应有「{want}」");
     }
+}
+
+/// 下载页（第 11 页）：页签名、页高、设置分页映射都要对齐；三个来源全关时页面停在空状态。
+#[test]
+fn download_page_renders_and_maps_to_its_settings_tab(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    assert_eq!(crate::app::PAGE_NAMES[crate::app::DOWNLOAD_PAGE],"下载");
+    assert_eq!(crate::app::PAGE_SETTINGS_TABS[crate::app::DOWNLOAD_PAGE],16);
+    assert_eq!(crate::extras::settings_tab_module(16),Some(crate::app::DOWNLOAD_PAGE));
+    assert!(h.app.settings.visible_pages[crate::app::DOWNLOAD_PAGE],"下载页默认开启");
+    // 三个来源全关：扫描直接返回空，页面走空状态，不去读本机真实下载记录。
+    h.app.settings.download_sources=[false;3];
+    h.app.show_page(crate::app::DOWNLOAD_PAGE);
+    for _ in 0..40 {h.frame(vec![]);}
+    assert!(h.app.open,"页面应展开");
+    assert_eq!(h.app.page,crate::app::DOWNLOAD_PAGE);
+    assert!((h.app.expanded_height()-crate::app::DOWNLOAD_H).abs()<0.001,"下载页用 AI 任务页那种高度");
+    h.app.download_tick();
+    assert!(h.app.download.items().is_empty(),"来源全关时不该产出下载");
+    // 设置分页 16 得真能画出来：模块标题、三个来源开关、上岛与删除开关都在。
+    h.app.settings_tab=16;h.app.open_settings();h.ctx.set_embed_viewports(false);
+    let output=std::sync::Arc::new(Mutex::new(None));let capture=output.clone();
+    egui::Context::set_immediate_viewport_renderer(move|ctx,mut viewport|{
+        let id=viewport.ids.this;
+        let raw=egui::RawInput{viewport_id:id,screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(690.0,1000.0))),time:Some(1.0),
+            viewports:std::iter::once((id,egui::ViewportInfo::default())).collect(),..Default::default()};
+        *capture.lock().unwrap()=Some(ctx.run(raw,|ctx|(viewport.viewport_ui_cb)(ctx)));
+    });
+    let _=h.ctx.run(egui::RawInput::default(),|ctx|h.app.settings_ui(ctx,false));
+    let shapes=output.lock().unwrap().take().unwrap().shapes;
+    let texts:Vec<String>=shapes.iter().filter_map(|s|match &s.shape{egui::Shape::Text(t)=>Some(t.galley.text().to_string()),_=>None}).collect();
+    for want in ["下载","下载来源","IDM","Free Download Manager","Ghost Downloader","有下载时上岛","上岛显示速度","删除前确认"]{
+        assert!(texts.iter().any(|t|t==want),"设置分页 16 里应有「{want}」");
+    }
+}
+
+/// 下载页的行：文件名/副行/汇总要真出来；点行开文件、文件夹按钮定位目录、
+/// 删除走两段确认；正在跑的那条要上岛常驻并给 MB/s 角标，收场后只留 6 秒。
+#[test]
+fn download_rows_open_reveal_and_delete_and_the_running_one_boards_the_island(){
+    use crate::download_scan::{DlState,DownloadItem,Source};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();h.app.settings.pet=false;
+    // 三个来源全关：不读本机真实下载记录，页面只认下面注入的两条。
+    h.app.settings.download_sources=[false;3];
+    h.app.settings.download_island=true;h.app.settings.download_island_speed=true;
+    h.app.settings.notifications=true;
+    let dir=std::env::temp_dir().join(format!("daozai-dl-{}",std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let done=dir.join("季度报告.pdf");
+    std::fs::write(&done,b"x").unwrap();
+    let now=crate::download_scan::now_ms();
+    let mib=1024*1024;
+    h.app.download.inject(vec![
+        DownloadItem{id:"ghost:1".into(),source:Source::Ghost,name:"ubuntu-24.04.iso".into(),
+            path:dir.join("ubuntu-24.04.iso"),total:1000*mib,done:453*mib,speed:2*mib,
+            state:DlState::Downloading,created_ms:now-60_000,finished_ms:None,detail:None,live:true},
+        DownloadItem{id:"idm:2".into(),source:Source::Idm,name:"季度报告.pdf".into(),
+            path:done.clone(),total:16_990_000,done:16_990_000,speed:0,state:DlState::Done,
+            created_ms:now-3_600_000,finished_ms:Some(now-3_000),detail:None,live:false},
+    ]);
+    h.app.show_page(crate::app::DOWNLOAD_PAGE);
+    for _ in 0..40{h.frame(vec![]);}
+    assert!(h.app.open,"页面应展开");
+    let texts:Vec<String>=h.shapes.iter().filter_map(|s|match &s.shape{egui::Shape::Text(t)=>Some(t.galley.text().to_string()),_=>None}).collect();
+    for want in ["ubuntu-24.04.iso","季度报告.pdf"]{
+        assert!(texts.iter().any(|t|t==want),"行里应有文件名「{want}」：{texts:?}");
+    }
+    assert!(texts.iter().any(|t|t.contains("共 2 条")),"底部要有汇总：{texts:?}");
+    assert!(texts.iter().any(|t|t.contains("下载中")),"副行要有状态：{texts:?}");
+    assert!(texts.iter().any(|t|t.contains("已完成")),"完成的行要标已完成：{texts:?}");
+    // 行内坐标从渲染出来的标题反推：标题左边缘就是卡片内的 x=68。
+    let (left,row_cy)=h.shapes.iter().find_map(|s|match &s.shape{
+        egui::Shape::Text(t) if t.galley.text()=="季度报告.pdf"=>{
+            let r=t.visual_bounding_rect();Some((r.left(),r.center().y))
+        },_=>None}).expect("完成的那条要真占一行");
+    let card_x=left-68.0;
+    let btn_y=row_cy+5.0;
+    // 点行本体 = 打开这个文件。
+    h.cmds.clear();
+    h.click(Pos2::new(left+50.0,row_cy));
+    assert!(h.cmds.iter().any(|c|matches!(c,crate::app::Cmd::Open(p) if p==&done)),"点行应该打开文件：{:?}",h.cmds);
+    // 文件夹按钮 = 打开所在目录（文件没了也能定位）。
+    h.cmds.clear();
+    h.click(Pos2::new(card_x+327.0,btn_y));
+    assert!(h.cmds.iter().any(|c|matches!(c,crate::app::Cmd::Reveal(p) if p==&done)),"文件夹按钮应该定位文件：{:?}",h.cmds);
+    // 删除：第一下只变「确认删?」，第二下才真删。
+    h.cmds.clear();
+    h.click(Pos2::new(card_x+355.0,btn_y));
+    h.frame(vec![]);
+    assert!(!h.cmds.iter().any(|c|matches!(c,crate::app::Cmd::DownloadDelete(_))),"第一下不该删：{:?}",h.cmds);
+    assert_eq!(h.app.download_confirm.as_ref().map(|(id,_)|id.as_str()),Some("idm:2"),"第一下进入确认态");
+    let texts:Vec<String>=h.shapes.iter().filter_map(|s|match &s.shape{egui::Shape::Text(t)=>Some(t.galley.text().to_string()),_=>None}).collect();
+    assert!(texts.iter().any(|t|t=="确认删?"),"确认态要写清在确认什么：{texts:?}");
+    h.click(Pos2::new(card_x+355.0,btn_y));
+    assert!(h.cmds.iter().any(|c|matches!(c,crate::app::Cmd::DownloadDelete(p) if p==&done)),"第二下才真删：{:?}",h.cmds);
+    assert!(h.app.download_confirm.is_none(),"删完要退出确认态");
+    // 上岛：正在跑的那条占住通知位并常驻，角标按 MB/s 报速度。
+    h.app.notice=None;h.app.alerts.clear();
+    h.app.download_island_tick();
+    let card=h.app.notice.clone().expect("进行中的下载要上岛");
+    let notice=card.download.clone().expect("这是一张下载卡片");
+    assert_eq!(notice.id,"ghost:1","岛上显示最近活跃的那条");
+    assert!(card.duration>1_000.0,"进行中的卡片要常驻（duration={}）",card.duration);
+    assert!(notice.detail.contains("2.00 MB/s"),"副行要有速度：{}",notice.detail);
+    let badge=h.app.download_badge().expect("进行中的下载要给角标");
+    assert_eq!(badge.rate_unit,crate::task_ui::BadgeUnit::Bytes);
+    assert!((badge.rate-2.0).abs()<0.01,"2 MiB/s 要报成 2.0 MB/s：{}",badge.rate);
+    assert!((badge.progress.unwrap_or(-1.0)-0.453).abs()<0.01,"环要按真实百分比：{:?}",badge.progress);
+    // 收场：改成完成以后不再刷新卡片时间，只留 6 秒；角标随之消失。
+    let mut items=h.app.download.items().to_vec();
+    items[0].state=DlState::Done;items[0].done=items[0].total;
+    items[0].finished_ms=Some(crate::download_scan::now_ms());
+    h.app.download.inject(items);
+    h.app.download_island_tick();
+    let card=h.app.notice.clone().expect("收场后再报一次");
+    assert!((card.duration-6.0).abs()<0.001,"完成后只留 6 秒（duration={}）",card.duration);
+    assert!(h.app.download_badge().is_none(),"没有进行中的任务就不该再出角标");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// 出图用：把五种阶段各塞一条任务，存进 `DAOZAI_FEATURE_PREVIEW_DIR` 看排布。

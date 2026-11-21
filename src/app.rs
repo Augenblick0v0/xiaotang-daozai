@@ -37,8 +37,11 @@ pub const CALENDAR_PAGE: usize = 7;
 pub const WEATHER_PAGE: usize = 8;
 /// AI 任务页：本机 Codex / Claude / DeepSeek 会话正在做什么。
 pub const TASK_PAGE: usize = 9;
+/// 下载页：IDM / Free Download Manager / Ghost Downloader 最近下载的任务。
+pub const DOWNLOAD_PAGE: usize = 10;
 pub(crate) const WEATHER_H: f32 = 232.0;
 pub(crate) const TASK_H: f32 = 232.0;
+pub(crate) const DOWNLOAD_H: f32 = 232.0;
 pub(crate) const CALENDAR_H: f32 = 216.0;
 pub const BAR_W: f32 = 163.0; // 收起药丸宽
 pub const BAR_H: f32 = 30.0; // 收起药丸高
@@ -90,8 +93,8 @@ fn pill_shadow(painter:&egui::Painter,rect:Rect,radius:f32,strength:f32){
         painter.rect_filled(r,radius+grow*0.8,Color32::from_black_alpha((255.0*a*strength) as u8));
     }
 }
-pub(crate) const PAGE_NAMES: [&str; 10] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "AI 任务"];
-pub(crate) const PAGE_SETTINGS_TABS: [usize; 10] = [1,2,3,5,4,7,11,8,12,15];
+pub(crate) const PAGE_NAMES: [&str; 11] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "AI 任务", "下载"];
+pub(crate) const PAGE_SETTINGS_TABS: [usize; 11] = [1,2,3,5,4,7,11,8,12,15,16];
 
 // ---------- 动效参数 ----------
 /// 悬停意图缓冲：光标停留这么久才真正展开（期间药丸轻微胀大作为反馈），防误触。
@@ -198,6 +201,8 @@ pub enum Cmd {
     /// AI 任务行被点开：回到那个客户端（DSH 就是 DeepSeek Harness 窗口），
     /// 日志路径只作为「找不到窗口」时的兜底。
     OpenTask(crate::task_scan::Source, Option<PathBuf>),
+    /// 下载页删掉一行：外壳把文件送进回收站（可撤销），不动记录本身。
+    DownloadDelete(PathBuf),
     Copy(String),
     Notify(String, String, NotificationSound),
     RequestNotifications,
@@ -765,7 +770,7 @@ pub struct App {
     page_dir: f32,
     page_t0: f64,
     slide: Spring,
-    dots: [Spring; 10],
+    dots: [Spring; 11],
     wheel_delta: f32,
     pub(crate) content_scroll: Option<(egui::Id, f32)>,
     wheel_at: f64,
@@ -918,6 +923,12 @@ pub struct App {
     pub(crate) resident_power: (Option<u8>,bool),
     /// AI 任务页：后台扫描本机 Codex / Claude / DeepSeek 会话的进度。
     pub(crate) task: crate::task_scan::Watcher,
+    /// 下载页：后台读取 IDM / FDM / Ghost 的最近下载任务。
+    pub(crate) download: crate::download_scan::Watcher,
+    /// 删除前的第二段确认：`(任务 id, 第一次点下的时刻)`，4 秒内再点才真删。
+    pub(crate) download_confirm: Option<(String, f64)>,
+    /// 被手动点掉的那条上岛卡片：同一轮下载里不再自动弹回来（收场后自动失效）。
+    pub(crate) download_dismissed: Option<String>,
 }
 
 impl App {
@@ -1054,6 +1065,9 @@ impl App {
             updates: crate::updates::State::load(model::config_dir().join("update-check.json")),
             resident: Default::default(), resident_power:(None,false),
             task: crate::task_scan::Watcher::new(),
+        download: crate::download_scan::Watcher::new(),
+        download_confirm: None,
+        download_dismissed: None,
         }
     }
 
@@ -1799,10 +1813,15 @@ impl App {
     /// 药丸平时只包住常驻内容（左右各 16 点），所以留的位置要按角标宽度加倍（平分到两侧）。
     fn island_badge_reserve(&self)->f32 {
         if self.open || self.effective_minimal() {return 0.0;}
-        if !(self.settings.task_island_speed||self.settings.task_island_progress) {return 0.0;}
         let Some(badge)=self.island_badge() else {return 0.0;};
-        let ring=badge.progress.is_some()&&self.settings.task_island_progress;
-        let speed=badge.rate>=1.0&&self.settings.task_island_speed;
+        // 两个来源各受自己的开关管：AI 任务看 `task_island_*`，下载看 `download_island_speed`
+        //（下载的进度环没有单独开关——读到真实百分比就该画出来）。
+        let (want_speed,want_ring)=match badge.rate_unit {
+            crate::task_ui::BadgeUnit::Tokens=>(self.settings.task_island_speed,self.settings.task_island_progress),
+            crate::task_ui::BadgeUnit::Bytes=>(self.settings.download_island_speed,true),
+        };
+        let ring=badge.progress.is_some()&&want_ring;
+        let speed=badge.rate>0.0&&want_speed;
         match (ring,speed) {
             (true,true)=>ISLAND_BADGE_W,
             (false,true)=>ISLAND_BADGE_TEXT_W,
@@ -1813,7 +1832,11 @@ impl App {
     fn lyric_focus_space(&self)->f32 {if self.pomo.running{crate::focus_bar::LYRIC_WIDTH+10.0}else{0.0}}
     fn lyric_bar_width(&self)->f32 {LYRIC_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()}
     fn notice_size(&self,a:&Alert)->(f32,f32) {
-        let (width,height)=if a.meeting.is_some(){(360.0,136.0)}else if a.source==crate::extras::AlertSource::Internal && a.title=="蓝牙设备"{(HUD_W,48.0)}else if a.is_hud(){(HUD_W,38.0)}else{(334.0,44.0)};
+        let (width,height)=if a.meeting.is_some(){(360.0,136.0)}
+            else if a.download.is_some(){(334.0,56.0)}
+            else if a.source==crate::extras::AlertSource::Internal && a.title=="蓝牙设备"{(HUD_W,48.0)}
+            else if a.is_hud(){(HUD_W,38.0)}
+            else {(334.0,44.0)};
         (width,height)
     }
     pub fn set_pet(&mut self,enabled:bool) {
@@ -1857,7 +1880,7 @@ impl App {
     }
 
     pub(crate) fn expanded_height(&self)->f32 {
-        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==TASK_PAGE {TASK_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
+        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==TASK_PAGE {TASK_H}else if self.page==DOWNLOAD_PAGE {DOWNLOAD_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
     }
 
     // ---------------------------------------------------------------
@@ -1877,6 +1900,8 @@ impl App {
         self.weather_tick();
         self.task_tick();
         self.task_island_tick();
+        self.download_tick();
+        self.download_island_tick();
         self.current_hour=env.hour();
         self.system_idle=env.idle_seconds;
         self.dt = dt;
@@ -3024,8 +3049,10 @@ impl App {
         if a_head > 0.0 {
             paint::clock(&base.faded(a_head),cpos.0,cpos.1-0.5,&clock,size::CLOCK);
         }
-        // 收起态岛角标：当前 AI 任务的 token 速度 + 完成进度（`[环][173 t/s]`）。
-        // 只在收起、非极简、对应设置打开时画；展开后任务页本身有更完整的呈现。
+        // 收起态岛角标：`[环][速度]`。
+        // 谁先来：正在跑的下载（字节/秒）压过 AI 任务（token/秒），两者共用这一处版式，
+        // 单位由 `rate_unit` 决定。只在收起、非极简、对应设置打开时画；
+        // 展开后任务页/下载页本身有更完整的呈现。
         // 歌词占着药丸（它比常驻内容宽得多）时不画：那会儿药丸的左边缘是封面和歌词，
         // 角标压上去只会糊成一片，等歌词退场自然就回来了。
         let badge_quiet = lyric_alpha <= 0.003
@@ -3035,11 +3062,19 @@ impl App {
         if self.island_badge_reserve() > 0.0 && badge_quiet {
             if let Some(badge)=self.island_badge() {
                 let ring_r=5.5;
-                let rate=self.settings.task_island_speed && badge.rate>=1.0;
-                let text=if rate {
-                    if badge.rate>=1000.0 {format!("{:.1}k t/s",badge.rate/1000.0)}else{format!("{:.0} t/s",badge.rate)}
+                let (speed_on,ring_on)=match badge.rate_unit {
+                    crate::task_ui::BadgeUnit::Tokens=>(self.settings.task_island_speed,self.settings.task_island_progress),
+                    crate::task_ui::BadgeUnit::Bytes=>(self.settings.download_island_speed,true),
+                };
+                let show_speed=speed_on && badge.rate>0.0;
+                let text=if show_speed {
+                    match badge.rate_unit {
+                        crate::task_ui::BadgeUnit::Tokens=>if badge.rate>=1000.0 {format!("{:.1}k t/s",badge.rate/1000.0)}else{format!("{:.0} t/s",badge.rate)},
+                        // 下载按 MB/s 报；不到 1 MB/s 换成 KB/s，别写着 `0.0 MB/s`。
+                        crate::task_ui::BadgeUnit::Bytes=>if badge.rate>=1.0 {format!("{:.1} MB/s",badge.rate)}else{format!("{:.0} KB/s",badge.rate*1024.0)},
+                    }
                 } else {String::new()};
-                let progress=self.settings.task_island_progress.then_some(badge.progress).flatten();
+                let progress=if ring_on {badge.progress} else {None};
                 // 右对齐贴在常驻内容左边：常驻布局以药丸中心居中，它的墨水从
                 // `local_cx - layout.width/2 + 16` 起排（16 是布局自带的内边距）。
                 // 预留出来的那点宽度由中心平分，所以从这条墨水线往回排一定落在空地。
@@ -3047,7 +3082,7 @@ impl App {
                 // 也只会把环推歪一点，不会让字压到电池/时钟上。
                 let ink_left=local_cx-layout.width/2.0+16.0;
                 let anchor=ink_left-8.0;
-                if rate {
+                if show_speed {
                     base.text(anchor,18.6,&text,9.5,W::Regular,theme::GRAY,H::Right);
                 }
                 if let Some(progress)=progress {
@@ -3223,6 +3258,7 @@ impl App {
             8 if self.weather.solar_open => ("日出", "日落", theme::YELLOW),
             8 => ("当地", "天气", theme::CYAN),
             TASK_PAGE => ("AI", "任务", theme::SOFT_GREEN),
+            10 => return,
             _ => ("岛仔", "设置", theme::WHITE),
         };
         let wa = c.text(15.0, base, a, size::TITLE, W::Bold, theme::WHITE, H::Left);
@@ -3234,7 +3270,7 @@ impl App {
     fn nav(&mut self, c: &Card) {
         let pages: Vec<_>=self.settings.page_order.iter().copied().filter(|page|self.settings.visible_pages[*page]).collect();
         if pages.len()<2 { return; }
-        let arrow_y=if self.page==6||self.page==8||self.page==TASK_PAGE{88.0}else{68.0};
+        let arrow_y=if self.page==6||self.page==8||self.page==TASK_PAGE||self.page==DOWNLOAD_PAGE{88.0}else{68.0};
         let l = c.hit(8.0, arrow_y-13.0, 26.0, 26.0, "nav-l");
         let r = c.hit(385.0, arrow_y-13.0, 26.0, 26.0, "nav-r");
         let (lh, lp) = c.hover_t(&l);
@@ -3282,6 +3318,7 @@ impl App {
             6 => self.page_quota(c),
             8 => self.page_weather(c,env,cmds),
             TASK_PAGE => self.page_task(c, env, cmds),
+            DOWNLOAD_PAGE => self.page_download(c, env, cmds),
             CALENDAR_PAGE => self.page_calendar(c,env),
             _ => self.page_settings(c),
         }

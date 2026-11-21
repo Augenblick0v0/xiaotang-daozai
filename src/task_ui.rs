@@ -26,9 +26,18 @@ const ROWS: usize = 4;
 ///
 /// `rate < 1.0` 视为没有速度（扫描器拿不到就填 0），`progress` 只在客户端自己报了
 /// 待办清单时才有值——没有真实进度就不画环，和任务页的规矩保持一致。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BadgeUnit {
+    /// AI 任务的 token 速度，跟着 `task_island_speed` / `task_island_progress` 两个开关走。
+    Tokens,
+    /// 下载的字节速度（MB/s），跟着 `download_island_speed` 走（下载的进度环没有单独开关）。
+    Bytes,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct IslandBadge {
     pub rate: f32,
+    pub rate_unit: BadgeUnit,
     pub progress: Option<f32>,
 }
 
@@ -187,7 +196,7 @@ impl App {
 
     /// 收起态岛角标要显示的那一个任务：等你确认的优先，其次最近有动静的。
     /// 没有在跑的（或既没速度也没真实进度、画出来也是空的）就给 `None`。
-    pub(crate) fn island_badge(&self) -> Option<IslandBadge> {
+    pub(crate) fn task_badge(&self) -> Option<IslandBadge> {
         badge_for(pick_island_task(self.task.items())?)
     }
 
@@ -223,7 +232,7 @@ fn badge_for(task: &TaskItem) -> Option<IslandBadge> {
     if rate <= 0.0 && progress.is_none() {
         return None;
     }
-    Some(IslandBadge { rate, progress })
+    Some(IslandBadge { rate, rate_unit: BadgeUnit::Tokens, progress })
 }
 
 /// 从一批任务里挑出岛上要显示的那一个：`needs_user` 优先，同档取 `updated_ms` 最大的。

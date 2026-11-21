@@ -109,6 +109,7 @@ imap = "2.4"
 imap-proto = "0.10.2"
 native-tls = "0.2"
 keyring = { version = "3", features = ["windows-native"] }
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled"] }
 
 [profile.release]
 opt-level = 3

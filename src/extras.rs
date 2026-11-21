@@ -41,6 +41,8 @@ pub(crate) struct Alert {
     pub bluetooth: Option<(crate::bt::DeviceKind, bool)>,
     pub meeting: Option<(crate::mail::Meeting, String)>,
     pub unread: Option<crate::app::Unread>,
+    /// 下载卡片：带上它就换成「文件名 + 进度条 + 速度」那套版式（见 `download_ui`）。
+    pub download: Option<crate::download_ui::DownloadNotice>,
 }
 impl Alert {
     pub(crate) fn health(&self)->Option<HealthReminder> {
@@ -256,6 +258,7 @@ impl App {
             bluetooth: None,
             meeting: None,
             unread: None,
+            download: None,
         };
         self.enqueue_alert(a, system);
     }
@@ -263,7 +266,7 @@ impl App {
         self.enqueue_alert(Alert {
             source: AlertSource::Internal,
             title: "会议提醒".into(), body: format!("{} · {} · {}", meeting.title, meeting.at, source),
-            page, at: self.t, duration: 12.0, bluetooth: None, meeting: Some((meeting, source)), unread: None,
+            page, at: self.t, duration: 12.0, bluetooth: None, meeting: Some((meeting, source)), unread: None, download: None,
         }, true);
     }
     pub(crate) fn bluetooth_alert(&mut self, device: &crate::bt::Device, connected: bool) {
@@ -280,6 +283,7 @@ impl App {
             bluetooth: Some((device.kind, connected)),
             meeting: None,
             unread: None,
+            download: None,
         };
         self.enqueue_alert(a, false);
     }
@@ -373,7 +377,7 @@ impl App {
         self.mark_messenger(client,unread.pid,unread.window);
         if pending{return;}
         self.notification_bell_at=self.t;self.notification_bell_until=self.t+4.5;
-        self.enqueue_alert(Alert{source:AlertSource::Messenger(client),title:client.name().into(),body:format!("有新消息 · 请到{}查看",client.name()),page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread:Some(unread)},false);
+        self.enqueue_alert(Alert{source:AlertSource::Messenger(client),title:client.name().into(),body:format!("有新消息 · 请到{}查看",client.name()),page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread:Some(unread),download:None},false);
     }
     pub fn set_messenger_status(&mut self,client:crate::app::Messenger,status:String){self.messenger_statuses.insert(client,status);}
     pub fn messenger_status(&self,client:crate::app::Messenger)->&str{self.messenger_statuses.get(&client).map(String::as_str).unwrap_or("")}
@@ -428,13 +432,13 @@ impl App {
             if let Some(code)=crate::otp::extract("",&text,&[]) {text=crate::mail_privacy::mask(&text,&code.text);}
             text
         }else{"收到新通知 · 内容已隐藏".into()};
-        self.enqueue_alert(Alert{source:AlertSource::External(id),title,body,page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread},false);
+        self.enqueue_alert(Alert{source:AlertSource::External(id),title,body,page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread,download:None},false);
     }
     pub fn reveal_messenger_notice(&mut self,unread:crate::app::Unread){
         if !unread.source.adapter().dismiss_unread || !self.pending_messengers.contains(&unread){return;}
         let body=if unread.pid==0{"消息账号暂无法确认"}else{"暂时无法打开对应窗口"};
         let source=if unread.source.adapter().capture==crate::messenger::Capture::Taskbar{AlertSource::Messenger(unread.source)}else{AlertSource::External(unread.source.adapter().notification_id.into())};
-        self.notice=Some(Alert{source,title:unread.source.name().into(),body:body.into(),page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread:Some(unread)});
+        self.notice=Some(Alert{source,title:unread.source.name().into(),body:body.into(),page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread:Some(unread),download:None});
         self.notification_bell_at=self.t;self.notification_bell_until=self.t+4.5;
     }
     pub(crate) fn tick_alerts(&mut self) {
@@ -495,6 +499,37 @@ impl App {
             if notice_button(&nc,226.0,12.0,60.0,"关闭","external-dismiss"){
                 self.notice=None;
                 self.notification_bell_until=0.0;
+            }
+            return;
+        }
+        if let Some(d)=&a.download {
+            // 下载卡片：一条任务占满整张卡——托盘图标、文件名、`大小 · 速度 · 百分比`，
+            // 底下一条细进度条。点卡片本体去下载页，右上角的 ✕ 只收起这张卡。
+            let tint=crate::download_ui::state_color(d.state);
+            crate::paint::tray(&nc,20.0,21.0,14.0,0.0,tint,Color32::from_white_alpha(26));
+            nc.centered_text(42.0,13.0,&nc.fit(&d.name,11.5,W::Semibold,246.0),11.5,W::Semibold,theme::WHITE,H::Left);
+            nc.centered_text(42.0,29.0,&nc.fit(&d.detail,10.0,W::Regular,246.0),10.0,W::Regular,theme::GRAY,H::Left);
+            let (bar_x,bar_w)=(16.0,302.0);
+            nc.fill(bar_x,44.0,bar_w,3.5,1.75,Color32::from_white_alpha(28));
+            if let Some(progress)=d.percent {
+                nc.fill(bar_x,44.0,(bar_w*progress.clamp(0.0,1.0)).max(3.5),3.5,1.75,tint);
+            } else if d.state.is_active() {
+                // 在跑但还没记到字节（Ghost 就是这样）：跑一段来回的条，不伪造 0%。
+                let w=bar_w*0.32;
+                let phase=((self.t*0.55)%1.0) as f32;
+                nc.fill(bar_x+(bar_w-w)*phase,44.0,w,3.5,1.75,tint.linear_multiply(0.55));
+            }
+            if nc.hit(0.0,0.0,290.0,40.0,"download-open").clicked(){
+                self.show_page(crate::app::DOWNLOAD_PAGE);
+            }
+            let close=nc.hit(296.0,2.0,22.0,22.0,"download-dismiss");
+            let (close_hover,_)=nc.hover_t(&close);
+            crate::paint::close(&nc,307.0,13.0,4.0,if close_hover>0.01{theme::WHITE}else{theme::DIM});
+            if close.clicked(){
+                // 记下「这条已经被手动收起」：同一轮下载里不再自动弹回来，
+                // 收起态药丸上的角标（进度环 + 速度）接手显示。
+                self.download_dismissed=Some(d.id.clone());
+                self.notice=None;
             }
             return;
         }
@@ -1293,6 +1328,7 @@ fn settings_page_icon(page:usize)->egui::ImageSource<'static>{
         MAIL_PAGE=>("mail",include_bytes!("../assets/settings-icons/system/mail.svg")),
         QUOTA_PAGE=>("quota",include_bytes!("../assets/settings-icons/system/quota.svg")),
         TASK_PAGE=>("ai-tasks",include_bytes!("../assets/settings-icons/system/tasks.svg")),
+        DOWNLOAD_PAGE=>("download",include_bytes!("../assets/settings-icons/system/download.svg")),
         CALENDAR_PAGE=>("calendar",include_bytes!("../assets/settings-icons/system/calendar.svg")),
         _=>("weather",include_bytes!("../assets/settings-icons/system/weather.svg")),
     };
@@ -1303,7 +1339,7 @@ fn settings_page_icon(page:usize)->egui::ImageSource<'static>{
 #[cfg_attr(not(test),allow(dead_code))]
 pub(crate) fn settings_tab_module(tab:usize)->Option<usize>{
     use crate::app::*;
-    match tab {1=>Some(MUSIC_PAGE),2=>Some(FOCUS_PAGE),3=>Some(WATER_PAGE),4=>Some(TODO_PAGE),5=>Some(SHELF_PAGE),7=>Some(MAIL_PAGE),8=>Some(CALENDAR_PAGE),11=>Some(QUOTA_PAGE),12=>Some(WEATHER_PAGE),15=>Some(TASK_PAGE),_=>None}
+    match tab {1=>Some(MUSIC_PAGE),2=>Some(FOCUS_PAGE),3=>Some(WATER_PAGE),4=>Some(TODO_PAGE),5=>Some(SHELF_PAGE),7=>Some(MAIL_PAGE),8=>Some(CALENDAR_PAGE),11=>Some(QUOTA_PAGE),12=>Some(WEATHER_PAGE),15=>Some(TASK_PAGE),16=>Some(DOWNLOAD_PAGE),_=>None}
 }
 
 pub(crate) fn settings_label(ui:&mut egui::Ui,text:&str){
@@ -1438,9 +1474,9 @@ pub(crate) const SETTINGS_TAB_APPEARANCE: usize = 13;
 pub(crate) const SETTINGS_TAB_POSITION: usize = 14;
 /// 侧栏：一项就是一页，不再有页内子标签。专注与健康（2、3）、待办与置物（4、5）各合成一页；关于固定左下角。
 /// 第四列是这一项之前的分组标题。
-const SETTINGS_GROUPS: [(&str,usize,usize,&str);14] = [
+const SETTINGS_GROUPS: [(&str,usize,usize,&str);15] = [
     ("通用",0,0,"岛仔"), ("外观",SETTINGS_TAB_APPEARANCE,SETTINGS_TAB_APPEARANCE,""), ("位置",SETTINGS_TAB_POSITION,SETTINGS_TAB_POSITION,""), ("页面管理",10,10,""),
-    ("音乐",1,1,"功能"), ("专注与健康",2,3,""), ("待办与置物",4,5,""), ("消息提醒",6,6,""), ("邮箱",7,7,""), ("日程",8,8,""), ("AI 额度",11,11,""), ("天气",12,12,""), ("AI 任务",15,15,""),
+    ("音乐",1,1,"功能"), ("专注与健康",2,3,""), ("待办与置物",4,5,""), ("消息提醒",6,6,""), ("邮箱",7,7,""), ("日程",8,8,""), ("AI 额度",11,11,""), ("天气",12,12,""), ("AI 任务",15,15,""), ("下载",16,16,""),
     ("关于",9,9,""),
 ];
 /// 分页标题；合并页（3→2、5→4）显示合并后的名字。
@@ -1545,6 +1581,7 @@ impl App {
                         6=>egui::include_image!("../assets/settings-icons/system/notifications.svg"),
                         12=>egui::include_image!("../assets/settings-icons/system/weather.svg"),
                         15=>egui::include_image!("../assets/settings-icons/system/tasks.svg"),
+                        16=>egui::include_image!("../assets/settings-icons/system/download.svg"),
                         7=>egui::include_image!("../assets/settings-icons/system/mail.svg"),
                         8=>egui::include_image!("../assets/settings-icons/system/calendar.svg"),
                         SETTINGS_TAB_APPEARANCE=>egui::include_image!("../assets/settings-icons/system/appearance.svg"),
@@ -1577,6 +1614,11 @@ impl App {
                         ui.add_space(4.0);
                         ui.add_enabled_ui(on,|ui|self.task_settings(ui));
                     }
+                    16=>{
+                        let on=self.settings_feature_header(ui,crate::app::DOWNLOAD_PAGE,"IDM / Free Download Manager / Ghost Downloader 的最近下载",|_,_|{});
+                        ui.add_space(4.0);
+                        ui.add_enabled_ui(on,|ui|self.download_settings(ui));
+                    }
                     11=>{
                         let on=self.settings_feature_header(ui,crate::app::QUOTA_PAGE,"每 3 分钟自动更新剩余额度",|_,_|{});
                         ui.add_space(4.0);
@@ -1601,7 +1643,7 @@ impl App {
                         });
                         settings_label(ui,"功能页面");
                         settings_card(ui,|ui|{
-                            let descriptions=["播放控制与同步歌词","番茄钟与休息计时","喝水与久坐提醒","临时收纳文件位置","任务清单与到期提醒","邮件摘要与验证码","Agent 剩余额度和账号切换","月历、邮件邀请与工作日程","当地天气与七日预报","AI 会话进度与等你确认"];
+                            let descriptions=["播放控制与同步歌词","番茄钟与休息计时","喝水与久坐提醒","临时收纳文件位置","任务清单与到期提醒","邮件摘要与验证码","Agent 剩余额度和账号切换","月历、邮件邀请与工作日程","当地天气与七日预报","AI 会话进度与等你确认","IDM / FDM / Ghost 最近下载"];
                             ui.label(egui::RichText::new("拖动左侧手柄调整顺序；关闭的功能不在后台运行，不同步也不提醒，已有数据保留。").size(11.5).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
                             #[derive(Clone)]
                             struct PageDrag(usize);

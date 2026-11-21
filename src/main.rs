@@ -761,6 +761,13 @@ impl eframe::App for Shell {
                 },
                 Cmd::DisconnectNotifications=>{#[cfg(windows)]{self.incoming=None;self.app.settings.read_notifications=false;self.app.settings.save();self.app.listener_status="已断开，不再读取 Windows 通知".into();}},
                 Cmd::Reveal(p)=>{let _=daozai::child_process::spawn(std::process::Command::new("explorer.exe").arg(format!("/select,{}",p.display())));},
+                Cmd::DownloadDelete(p)=>{
+                    // 送回收站，不是真删：失败时只在 stderr 留一行，岛上不弹窗（列表下一轮自己会消失）。
+                    match trash_file(&p) {
+                        Ok(())=>self.app.say("已移到回收站"),
+                        Err(error)=>eprintln!("删除下载文件失败：{}（{error}）",p.display()),
+                    }
+                },
                 Cmd::OpenTask(source,log)=>{
                     #[cfg(windows)]
                     let focused=source.window_exe().is_some_and(|exe| daozai::native::focus_process_window(exe));
@@ -1023,6 +1030,53 @@ fn open_path_result(p:&std::path::Path,result:windows::core::Result<()>,choose:i
 #[cfg(not(windows))]
 fn open_path(_p: &std::path::Path)->Result<(),String> {Ok(())}
 
+/// `pFrom` 要的是「双 null 结尾」的宽字符串：路径 + `\0` + `\0`。
+/// 单独拆出来是为了能测——拼错了要么删错东西，要么删不掉。
+#[cfg(windows)]
+fn double_null_terminated(p: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = p.as_os_str().encode_wide().collect();
+    wide.push(0);
+    wide.push(0);
+    wide
+}
+
+/// 删下载文件：走 shell 的 `FO_DELETE` + `FOF_ALLOWUNDO`，文件进回收站，用户还能撤回来。
+///
+/// **不要**换成 `std::fs::remove_file`——那是直接抹掉，用户点了「删除」就再也找不回来了。
+#[cfg(windows)]
+fn trash_file(p: &std::path::Path) -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::{
+        SHFileOperationW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, SHFILEOPSTRUCTW,
+    };
+    if p.as_os_str().is_empty() {
+        return Err("路径为空".into());
+    }
+    let from = double_null_terminated(p);
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd: Default::default(),
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        pTo: PCWSTR::null(),
+        fFlags: (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_SILENT.0) as u16,
+        fAnyOperationsAborted: Default::default(),
+        hNameMappings: std::ptr::null_mut(),
+        lpszProgressTitle: PCWSTR::null(),
+    };
+    let code = unsafe { SHFileOperationW(&mut op) };
+    if code != 0 {
+        return Err(format!("SHFileOperationW 返回 {code}"));
+    }
+    if op.fAnyOperationsAborted.as_bool() {
+        return Err("用户取消了删除".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn trash_file(_p: &std::path::Path) -> Result<(), String> { Err("只有 Windows 支持移入回收站".into()) }
+
 #[cfg(all(test,windows))]
 mod open_path_tests {
     use super::*;
@@ -1064,6 +1118,40 @@ mod open_path_tests {
             let actual=open_path_result(std::path::Path::new(path),result,||panic!("非文件关联问题不能弹出打开方式"));
             assert_eq!(actual.is_ok(),success);
         }
+    }
+}
+
+#[cfg(all(test,windows))]
+mod trash_tests {
+    use super::*;
+
+    /// `pFrom` 拼错的两种下场：删错东西、或者根本删不掉。
+    #[test]
+    fn pfrom_keeps_the_whole_path_and_ends_with_two_nulls(){
+        let path=std::path::Path::new("C:\\下载\\岛屿 报告.zip");
+        let wide=double_null_terminated(path);
+        assert!(wide.len()>=4);
+        assert_eq!(wide[wide.len()-1],0);
+        assert_eq!(wide[wide.len()-2],0);
+        // 去掉结尾两个 0 应该完整还原原路径（中间不能有提前出现的 0）。
+        let restored=String::from_utf16(&wide[..wide.len()-2]).unwrap();
+        assert_eq!(restored,"C:\\下载\\岛屿 报告.zip");
+    }
+
+    #[test]
+    fn empty_path_is_refused_before_touching_the_shell(){
+        assert!(trash_file(std::path::Path::new("")).is_err());
+    }
+
+    /// 真删一次：文件应当被「移走」（进回收站），原位置不再存在。
+    /// 跑法：`cargo test --bin daozai pfrom -- --ignored --test-threads=1`
+    #[test]
+    #[ignore]
+    fn trash_moves_a_temp_file_into_the_recycle_bin(){
+        let path=std::env::temp_dir().join(format!("daozai-trash-{}.txt",std::process::id()));
+        std::fs::write(&path,b"fixture").unwrap();
+        assert_eq!(trash_file(&path),Ok(()));
+        assert!(!path.exists(),"送回收站之后原位置不该还留着文件");
     }
 }
 

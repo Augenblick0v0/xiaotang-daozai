@@ -154,7 +154,6 @@ fn decrypt(key: &[u8], host: &str, blob: &[u8], version: u32) -> Result<String, 
 }
 
 type RowCallback = unsafe extern "C" fn(*mut std::ffi::c_void, std::ffi::c_int, *mut *mut std::ffi::c_char, *mut *mut std::ffi::c_char) -> std::ffi::c_int;
-#[link(name = "winsqlite3")]
 extern "C" {
     fn sqlite3_open_v2(name: *const std::ffi::c_char, db: *mut *mut std::ffi::c_void, flags: std::ffi::c_int, vfs: *const std::ffi::c_char) -> std::ffi::c_int;
     fn sqlite3_exec(db: *mut std::ffi::c_void, sql: *const std::ffi::c_char, callback: Option<RowCallback>, data: *mut std::ffi::c_void, error: *mut *mut std::ffi::c_char) -> std::ffi::c_int;
