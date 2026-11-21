@@ -311,7 +311,8 @@ impl App {
         if self.download_confirm.as_ref().is_some_and(|(_, at)| self.t - *at > CONFIRM_SECONDS) {
             self.download_confirm = None;
         }
-        let show_speed = self.settings.download_island_speed;
+        // 页面里的速度是核心信息，不受「上岛显示速度」那个开关影响。
+            let show_speed = true;
         for (index, item) in items.iter().take(ROWS).enumerate() {
             let y = ROW_TOP + index as f32 * ROW_H;
             let exists = item.path.is_file();

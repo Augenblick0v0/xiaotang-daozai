@@ -1189,6 +1189,8 @@ impl H {
         let mut app = App::new(&ctx, Options { fetch_lyrics: false, pet_idle: 1e9 });
         // 测试不扫本机真实下载器数据（IDM/FDM/Ghost 的内容因机器而异，且会让上岛卡片顶掉常驻入口）。
         app.download.inject(Vec::new());
+        // 同理，AI 任务也要隔离：本机正在跑的会话会让角标占位，测试里宽度/命中会随机器变化。
+        app.task.inject(Vec::new());
         Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,interactive_transition:false,shapes:Vec::new(), bt:Vec::new(),media:Default::default(),power:(None,false),network:None,system_idle:None,screen_locked:false,fullscreen:false,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
     }
     fn frame(&mut self, events: Vec<egui::Event>) {

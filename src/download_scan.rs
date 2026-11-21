@@ -262,6 +262,8 @@ pub fn proc_alive(exe: &str) -> bool {
 
 /// 扫一遍三个源。纯读取：不写文件、不改注册表、不 panic。
 pub fn scan(roots: &Roots, cfg: &ScanConfig) -> Vec<DownloadItem> {
+    // 实时通道是懒启动的：谁先扫谁把它叫起来，之后一直在后台跑。
+    ghost_live::start();
     let mut items = Vec::new();
     if cfg.sources[Source::Idm.index()] {
         items.extend(parse_idm(cfg));
@@ -958,7 +960,55 @@ fn parse_ghost(roots: &Roots, _cfg: &ScanConfig) -> Vec<DownloadItem> {
     if before != after {
         return Vec::new();
     }
-    ghost_items(&text, proc_alive(Source::Ghost.exe())).unwrap_or_default()
+    let mut items = ghost_items(&text, false).unwrap_or_default();
+    // jsonl 只在「创建 / 完成」落盘，中间的 progress/speed 全是 0。真实数字在
+    // Ghost 的 WebSocket 快照里，有就盖上去；通道断了就保持快照值，不假装实时。
+    if let Some(live) = ghost_live::snapshot() {
+        apply_live(&mut items, &live);
+    }
+    items
+}
+
+/// 实时快照 → 条目。**百分比只信 `progress`**：Ghost 每秒按 step 重算它，而
+/// `receivedBytes` 是残的（同一份源码里 bili/ffmpeg 的 step 永远报 0，实测还有
+/// 34 MB 的任务完成时 received=0、400 MB 的任务完成时 received=393300224）。
+/// 所以：有 total 就用 progress×total；progress 还没动过才退回 received 兜底。
+fn apply_live(items: &mut [DownloadItem], live: &std::collections::HashMap<String, ghost_live::Snap>) {
+    for it in items.iter_mut() {
+        let Some(sid) = it.id.strip_prefix("ghost:") else { continue };
+        let Some(s) = live.get(sid) else { continue };
+        if s.total > 0 {
+            it.total = s.total;
+        }
+        let (state, detail) = if s.status.is_empty() {
+            (it.state, None)
+        } else {
+            ghost_state(&s.status)
+        };
+        let finished = state == DlState::Done || s.progress >= 99.95;
+        let mut done = if it.total == 0 {
+            s.received
+        } else if finished {
+            it.total
+        } else {
+            let by_progress = ((it.total as f64) * (s.progress as f64) / 100.0).round() as u64;
+            if by_progress > 0 {
+                by_progress
+            } else {
+                s.received.min(it.total)
+            }
+        };
+        done = if it.total > 0 { done.min(it.total) } else { done };
+        if done > 0 {
+            it.done = done;
+        }
+        it.speed = s.speed;
+        it.state = state;
+        if detail.is_some() {
+            it.detail = detail;
+        }
+        it.live = true;
+    }
 }
 
 /// 逐行解析；任意一行坏掉就整轮放弃（返回 None），不要半个列表。
@@ -1022,6 +1072,21 @@ fn ghost_file_path(v: &serde_json::Value) -> String {
     String::new()
 }
 
+/// Ghost 的状态串（jsonl 与实时快照共用一套口径）。实时通道给的小写，进来统一大写。
+fn ghost_state(raw: &str) -> (DlState, Option<String>) {
+    match raw {
+        "COMPLETED" => (DlState::Done, None),
+        "RUNNING" | "DOWNLOADING" => (DlState::Downloading, None),
+        "PAUSED" => (DlState::Paused, None),
+        "WAITING" => (DlState::Queued, None),
+        "FAILED" => (DlState::Failed, None),
+        // STOPPED 只在 exe 内部出现（状态机里比 FAILED 更早的一档），按失败算，
+        // 原文留在 detail 里方便对账。
+        "STOPPED" => (DlState::Failed, Some(raw.to_string())),
+        other => (DlState::Unknown, (!other.is_empty()).then(|| other.to_string())),
+    }
+}
+
 fn ghost_item(v: &serde_json::Value, live: bool) -> Option<DownloadItem> {
     let sid = v.get("taskId").and_then(|x| x.as_str())?.trim();
     if sid.is_empty() {
@@ -1045,17 +1110,7 @@ fn ghost_item(v: &serde_json::Value, live: bool) -> Option<DownloadItem> {
         .fold(0u64, |a, b| a.saturating_add(b));
 
     let raw_status = v.get("status").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-    let (state, status_detail) = match raw_status.as_str() {
-        "COMPLETED" => (DlState::Done, None),
-        "RUNNING" | "DOWNLOADING" => (DlState::Downloading, None),
-        "PAUSED" => (DlState::Paused, None),
-        "WAITING" => (DlState::Queued, None),
-        "FAILED" => (DlState::Failed, None),
-        // STOPPED 只在 exe 内部出现（状态机里比 FAILED 更早的一档），按失败算，
-        // 原文留在 detail 里方便对账。
-        "STOPPED" => (DlState::Failed, Some(raw_status.clone())),
-        other => (DlState::Unknown, (!other.is_empty()).then(|| other.to_string())),
-    };
+    let (state, status_detail) = ghost_state(&raw_status);
 
     let output = v.get("outputFolder").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
     let file_path = ghost_file_path(v);
@@ -1106,6 +1161,303 @@ fn ghost_item(v: &serde_json::Value, live: bool) -> Option<DownloadItem> {
     })
 }
 
+/* ---------- Ghost 实时通道（WebSocket，1 Hz 全量快照） ---------- */
+
+/// Ghost 的浏览器扩展桥（`app/services/browser_service.py`）就是个 WebSocket 服务：
+/// 连上先发 `{"type":"hello","protocolVersion":2,"token":…}`，收到 `hello_ack` 后发
+/// `{"type":"subscribe_tasks"}`，之后每次任务变化都推 `{"type":"task_snapshot","tasks":[…]}`，
+/// 每个任务带 `progress / receivedBytes / fileSize / speed`。速度表（`speed_meter.py`）
+/// 每秒 emit 一次，所以下载中就是 1 Hz 的真实进度与速度——tasks.jsonl 里那两个 0
+/// 只是它不落盘而已。
+mod ghost_live {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    /// 一帧快照里我们关心的字段。
+    #[derive(Clone, Debug, Default)]
+    pub struct Snap {
+        pub progress: f32,
+        pub received: u64,
+        pub total: u64,
+        pub speed: u64,
+        pub status: String,
+    }
+
+    struct Inner {
+        snaps: HashMap<String, Snap>,
+        last_ms: i64,
+    }
+
+    /// 超过这个时间没有新快照就当通道断了：宁可不显示，也不拿旧数字装作实时。
+    const FRESH_MS: i64 = 5_000;
+    /// 端口写在配置里，但 AutoSelectPort 打开时它会漂，按源码的候选表兜底。
+    const CANDIDATE_PORTS: [u16; 5] = [14370, 24370, 34370, 44370, 38370];
+
+    fn inner() -> &'static Mutex<Inner> {
+        static INNER: OnceLock<Mutex<Inner>> = OnceLock::new();
+        INNER.get_or_init(|| {
+            Mutex::new(Inner {
+                snaps: HashMap::new(),
+                last_ms: 0,
+            })
+        })
+    }
+
+    /// 当前可用的快照；通道没连上、或已经 5 秒没有新数据，就返回 None。
+    pub fn snapshot() -> Option<HashMap<String, Snap>> {
+        let guard = inner().lock().unwrap_or_else(|e| e.into_inner());
+        if super::now_ms() - guard.last_ms > FRESH_MS {
+            return None;
+        }
+        Some(guard.snaps.clone())
+    }
+
+    /// 幂等启动：Watcher 建起来时调一次，之后一直在后台跑。
+    pub fn start() {
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        if STARTED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = std::thread::Builder::new()
+            .name("daozai-ghost-live".to_string())
+            .spawn(|| loop {
+                run_once();
+                std::thread::sleep(Duration::from_secs(4));
+            });
+    }
+
+    /// 从 Ghost 自己的配置里读端口和配对令牌（`Browser` 段）。
+    fn endpoint() -> Option<(u16, String)> {
+        let base = std::env::var_os("LOCALAPPDATA")?;
+        let path = PathBuf::from(base)
+            .join("GhostDownloader")
+            .join("UserConfig.json");
+        let text = std::fs::read_to_string(path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let browser = v.get("Browser")?;
+        if browser.get("EnableBrowserExtension").and_then(|x| x.as_bool()) != Some(true) {
+            return None;
+        }
+        let token = browser
+            .get("BrowserExtensionPairToken")?
+            .as_str()?
+            .trim()
+            .to_string();
+        if token.is_empty() {
+            return None;
+        }
+        let port = browser.get("Port").and_then(|x| x.as_u64()).unwrap_or(14370) as u16;
+        Some((port, token))
+    }
+
+    fn trace(msg: &str) {
+        if std::env::var_os("DAOZAI_GHOST_DEBUG").is_some() {
+            eprintln!("[ghost-live] {msg}");
+        }
+    }
+
+    fn run_once() {
+        let Some((configured, token)) = endpoint() else {
+            // Ghost 没装、或扩展桥没开：隔久一点再看，别空转。
+            std::thread::sleep(Duration::from_secs(6));
+            return;
+        };
+        let mut ports = vec![configured];
+        for p in CANDIDATE_PORTS {
+            if !ports.contains(&p) {
+                ports.push(p);
+            }
+        }
+        for port in ports {
+            match try_port(port, &token) {
+                Ok(()) => {
+                    trace(&format!("port {port} 断开，稍后重连"));
+                    return;
+                }
+                Err(e) => trace(&format!("port {port} 失败：{e}")),
+            }
+        }
+    }
+
+    /// 连一个端口，握手订阅，然后一直读快照直到连接结束。
+    fn try_port(port: u16, token: &str) -> Result<(), String> {
+        let url = format!("ws://127.0.0.1:{port}/");
+        let (mut ws, _resp) = tungstenite::connect(&url).map_err(|e| format!("connect: {e}"))?;
+        // 15 秒没有任何帧就当这条连接死了。Ghost 空闲时本来就不说话，
+        // 下载中则每秒都推——这个超时只用来兜「对面进程没了/网线拔了」。
+        if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = ws.get_mut() {
+            let _ = tcp.set_read_timeout(Some(Duration::from_millis(900)));
+        }
+        let hello = serde_json::json!({
+            "type": "hello",
+            "protocolVersion": 2,
+            "token": token,
+        });
+        ws.send(tungstenite::Message::Text(hello.to_string().into()))
+            .map_err(|e| format!("hello: {e}"))?;
+        // 先等 hello_ack：令牌不对时服务端会直接关连接，别把后面的订阅当成功。
+        let mut acked = false;
+        for _ in 0..8 {
+            match ws.read() {
+                Ok(tungstenite::Message::Text(text)) => {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    match v.get("type").and_then(|x| x.as_str()) {
+                        Some("hello_ack") => {
+                            acked = true;
+                            break;
+                        }
+                        Some("error") => return Err(format!("server: {text}")),
+                        _ => {}
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => return Err(format!("ack read: {e}")),
+            }
+        }
+        if !acked {
+            return Err("no hello_ack".to_string());
+        }
+        trace(&format!("port {port} hello_ack"));
+        let subscribe = tungstenite::Message::Text(r#"{"type":"subscribe_tasks"}"#.into());
+        ws.send(subscribe.clone())
+            .map_err(|e| format!("subscribe: {e}"))?;
+        // 光订阅只能拿到订阅那一刻的一份快照：Ghost 的每秒推送走的是
+        // speedMeter 事件，实测被动会话收不全（它自己还按 lastSnapshot 去重）。
+        // 所以到点没帧就再要一次——重发 subscribe 会把去重清掉并立刻回一份全量，
+        // 等价于 1 Hz 轮询，但没有 HTTP 的开销。
+        let mut idle_rounds: u32 = 0;
+        loop {
+            match ws.read() {
+                Ok(tungstenite::Message::Text(text)) => {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    if v.get("type").and_then(|x| x.as_str()) == Some("task_snapshot") {
+                        store(&v);
+                        idle_rounds = 0;
+                    }
+                }
+                Ok(tungstenite::Message::Ping(payload)) => {
+                    let _ = ws.send(tungstenite::Message::Pong(payload));
+                }
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    idle_rounds += 1;
+                    // 连续一分钟一个快照都没回，这条连接就是死的，交给上层重连。
+                    if idle_rounds > 60 {
+                        return Ok(());
+                    }
+                    // 一秒没动静就自己问一次。
+                    if ws.send(subscribe.clone()).is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(e) => return Err(format!("read: {e}")),
+            }
+        }
+    }
+
+    /// 调试用：原样打出 20 秒里收到的每一帧，看清 Ghost 到底在推什么。
+    #[cfg(test)]
+    pub fn raw_trace(secs: u64) {
+        let Some((port, token)) = endpoint() else {
+            println!("读不到 Ghost 配置");
+            return;
+        };
+        let url = format!("ws://127.0.0.1:{port}/");
+        let (mut ws, _) = match tungstenite::connect(&url) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("connect: {e}");
+                return;
+            }
+        };
+        if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = ws.get_mut() {
+            let _ = tcp.set_read_timeout(Some(Duration::from_millis(900)));
+        }
+        let hello = serde_json::json!({
+            "type": "hello", "protocolVersion": 2, "token": token,
+            "requestId": "trace", "extensionVersion": "9.9.9", "installType": "probe",
+        });
+        let _ = ws.send(tungstenite::Message::Text(hello.to_string().into()));
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_secs(secs) {
+            match ws.read() {
+                Ok(tungstenite::Message::Text(t)) => {
+                    let raw: &str = t.as_str();
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+                        let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("?");
+                        let tasks = v.get("tasks").and_then(|x| x.as_array());
+                        match tasks {
+                            Some(list) => {
+                                let hot: Vec<String> = list.iter().filter(|x| {
+                                    x.get("status").and_then(|s| s.as_str()).map(|s| s != "completed").unwrap_or(false)
+                                }).map(|x| format!("{}:{}:{:.1}%:{}", x.get("taskId").and_then(|s| s.as_str()).unwrap_or("?"),
+                                    x.get("status").and_then(|s| s.as_str()).unwrap_or("?"),
+                                    x.get("progress").and_then(|s| s.as_f64()).unwrap_or(0.0),
+                                    x.get("speed").and_then(|s| s.as_u64()).unwrap_or(0))).collect();
+                                println!("[{:>5.1}s] {kind} tasks={} hot={:?}", t0.elapsed().as_secs_f64(), list.len(), hot);
+                            }
+                            None => {
+                                let s: String = raw.chars().take(200).collect();
+                                println!("[{:>5.1}s] {kind} {}", t0.elapsed().as_secs_f64(), s);
+                            }
+                        }
+                    }
+                }
+                Ok(other) => println!("[{:>5.1}s] other {other:?}", t0.elapsed().as_secs_f64()),
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                {
+                    let _ = ws.send(tungstenite::Message::Text(r#"{"type":"subscribe_tasks"}"#.into()));
+                }
+                Err(e) => {
+                    println!("[{:>5.1}s] err {e}", t0.elapsed().as_secs_f64());
+                    break;
+                }
+            }
+        }
+    }
+
+    fn store(v: &serde_json::Value) {        let Some(tasks) = v.get("tasks").and_then(|x| x.as_array()) else {
+            return;
+        };
+        let mut snaps = HashMap::with_capacity(tasks.len());
+        for t in tasks {
+            let Some(id) = t.get("taskId").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            snaps.insert(
+                id.to_string(),
+                Snap {
+                    progress: t.get("progress").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                    received: t.get("receivedBytes").and_then(|x| x.as_u64()).unwrap_or(0),
+                    total: t.get("fileSize").and_then(|x| x.as_u64()).unwrap_or(0),
+                    speed: t.get("speed").and_then(|x| x.as_u64()).unwrap_or(0),
+                    status: t
+                        .get("status")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_uppercase(),
+                },
+            );
+        }
+        let mut guard = inner().lock().unwrap_or_else(|e| e.into_inner());
+        guard.snaps = snaps;
+        guard.last_ms = super::now_ms();
+    }
+}
+
 /* ---------- 后台轮询 ---------- */
 
 /// 每 `POLL_INTERVAL` 在后台线程扫一次，结果通过通道回传，UI 线程永不阻塞。
@@ -1121,6 +1473,8 @@ pub struct Watcher {
 
 impl Watcher {
     pub fn new() -> Self {
+        // Ghost 的实时快照靠一条常驻 WebSocket，跟轮询无关：先把它挂起来。
+        ghost_live::start();
         Self {
             items: Vec::new(),
             manual: false,
@@ -1496,6 +1850,237 @@ mod tests {
             }
         } else {
             println!("岛上没有要报的下载（没有进行中的，也没有 6 秒内收场的）");
+        }
+    }
+
+    /// 端到端：`scan()` 出来的 Ghost 行必须带真实百分比与速度。
+    /// 跑之前先开一个真下载：`py -3 .probe\ghost_live_probe.py <URL> <NAME> <SIZE> <BLOCKS> <WATCH>`。
+    #[test]
+    #[ignore]
+    fn live_scan_reports_a_running_ghost_download() {
+        // 自己造一个真下载：测试不该依赖「人刚好在下载」这种时机。
+        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        let mut child = std::process::Command::new("py")
+            .args([
+                "-3",
+                ".probe/ghost_live_probe.py",
+                "http://127.0.0.1:18081/scan_e2e.bin",
+                "scan_e2e.bin",
+                "104857600",
+                "2",
+                "120",
+            ])
+            .current_dir(&root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("起不来 python 探针（需要 py 与 .probe\\\\ghost_live_probe.py，且 18081 有限速源）");
+        std::thread::sleep(Duration::from_secs(4));
+        let roots = Roots::real();
+        let cfg = ScanConfig::default();
+        let mut seen: Vec<(f32, u64)> = Vec::new();
+        for _ in 0..25 {
+            std::thread::sleep(Duration::from_secs(1));
+            let items = scan(&roots, &cfg);
+            if let Some(it) = items
+                .iter()
+                .find(|i| i.source == Source::Ghost && i.state == DlState::Downloading)
+            {
+                println!(
+                    "{} | {:.2}% | {} | {} | live={}",
+                    it.name,
+                    it.percent() * 100.0,
+                    it.speed_text(),
+                    it.size_text(),
+                    it.live
+                );
+                seen.push((it.percent(), it.speed));
+            }
+        }
+        let _ = child.kill();
+        assert!(!seen.is_empty(), "没抓到正在跑的 Ghost 下载：探针没起来或源没开");
+        assert!(seen.iter().any(|(_, s)| *s > 0), "应当读到实时速度");
+        assert!(
+            seen.last().unwrap().0 >= seen[0].0,
+            "百分比不该倒退：{:?}",
+            seen
+        );
+    }
+    fn live_row(id: &str, total: u64, done: u64, state: DlState) -> DownloadItem {
+        DownloadItem {
+            id: id.to_string(),
+            source: Source::Ghost,
+            name: "a.bin".to_string(),
+            path: PathBuf::from("C:\\Downloads\\a.bin"),
+            total,
+            done,
+            speed: 0,
+            state,
+            created_ms: 1_700_000_000_000,
+            finished_ms: None,
+            detail: None,
+            live: false,
+        }
+    }
+
+    fn snap(received: u64, total: u64, speed: u64, progress: f32, status: &str) -> ghost_live::Snap {
+        ghost_live::Snap {
+            progress,
+            received,
+            total,
+            speed,
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn live_snapshot_turns_a_stale_jsonl_row_into_real_numbers() {
+        let mut items = vec![
+            live_row("ghost:tsk_1", 0, 0, DlState::Downloading),
+            live_row("idm:9", 10, 5, DlState::Downloading),
+        ];
+        let mut live = std::collections::HashMap::new();
+        live.insert(
+            "tsk_1".to_string(),
+            snap(528_000, 1_048_576, 2_097_152, 50.0, "RUNNING"),
+        );
+        apply_live(&mut items, &live);
+        assert_eq!(items[0].total, 1_048_576);
+        // progress 是唯一的百分比真源：50% × 1048576，不采用那个偏大的 received。
+        assert_eq!(items[0].done, 524_288);
+        assert_eq!(items[0].speed, 2_097_152);
+        assert!(items[0].live, "有实时数字的行不该再标「上次记录」");
+        assert_eq!(items[0].state, DlState::Downloading);
+        // 快照只认 Ghost 的 taskId，别的源一概不碰。
+        assert_eq!(items[1].total, 10);
+        assert_eq!(items[1].done, 5);
+        assert!(!items[1].live);
+    }
+
+    #[test]
+    fn live_snapshot_derives_done_from_progress_when_received_bytes_is_zero() {
+        let mut items = vec![live_row("ghost:tsk_2", 1000, 0, DlState::Downloading)];
+        let mut live = std::collections::HashMap::new();
+        live.insert("tsk_2".to_string(), snap(0, 1000, 0, 25.0, "RUNNING"));
+        apply_live(&mut items, &live);
+        assert_eq!(items[0].done, 250);
+    }
+
+    #[test]
+    fn a_finished_task_counts_as_full_even_when_its_byte_counter_lags() {
+        // Ghost 的完成记录里 received 常比 fileSize 小（30464654 / 37105682），
+        // 但 progress 已经是 100——这时按收字节算会显示 82%，必须按满算。
+        let mut items = vec![live_row("ghost:tsk_5", 37_105_682, 0, DlState::Downloading)];
+        let mut live = std::collections::HashMap::new();
+        live.insert(
+            "tsk_5".to_string(),
+            snap(30_464_654, 37_105_682, 0, 100.0, "COMPLETED"),
+        );
+        apply_live(&mut items, &live);
+        assert_eq!(items[0].done, 37_105_682);
+        assert_eq!(items[0].percent(), 1.0);
+        assert_eq!(items[0].state, DlState::Done);
+    }
+
+    #[test]
+    fn live_snapshot_never_reports_more_than_the_total() {
+        let mut items = vec![live_row("ghost:tsk_3", 1000, 0, DlState::Downloading)];
+        let mut live = std::collections::HashMap::new();
+        live.insert("tsk_3".to_string(), snap(2000, 1000, 0, 100.0, "RUNNING"));
+        apply_live(&mut items, &live);
+        assert_eq!(items[0].done, 1000);
+    }
+
+    #[test]
+    fn a_broken_byte_counter_cannot_inflate_the_bar() {
+        // 实测里 400 MB 的任务收到 393300224 字节时报 94%，而 progress 才 25%——
+        // 按 received 画就会跳一大截，所以百分比只跟 progress 走。
+        let mut items = vec![live_row("ghost:tsk_6", 419_430_400, 0, DlState::Downloading)];
+        let mut live = std::collections::HashMap::new();
+        live.insert(
+            "tsk_6".to_string(),
+            snap(393_300_224, 419_430_400, 0, 25.0, "RUNNING"),
+        );
+        apply_live(&mut items, &live);
+        assert_eq!(items[0].done, 104_857_600);
+    }
+
+    #[test]
+    fn live_status_overrides_the_snapshot_state() {
+        let mut items = vec![live_row("ghost:tsk_4", 1000, 0, DlState::Queued)];
+        let mut live = std::collections::HashMap::new();
+        live.insert("tsk_4".to_string(), snap(1000, 1000, 0, 100.0, "COMPLETED"));
+        apply_live(&mut items, &live);
+        assert_eq!(items[0].state, DlState::Done);
+    }
+
+    #[test]
+    fn ghost_status_strings_are_the_shared_vocabulary() {
+        assert_eq!(ghost_state("RUNNING").0, DlState::Downloading);
+        assert_eq!(ghost_state("PAUSED").0, DlState::Paused);
+        assert_eq!(ghost_state("WAITING").0, DlState::Queued);
+        assert_eq!(ghost_state("COMPLETED").0, DlState::Done);
+        assert_eq!(ghost_state("STOPPED").0, DlState::Failed);
+        assert_eq!(ghost_state("STOPPED").1.as_deref(), Some("STOPPED"));
+        assert_eq!(ghost_state("SOMETHING_NEW").0, DlState::Unknown);
+        assert_eq!(
+            ghost_state("SOMETHING_NEW").1.as_deref(),
+            Some("SOMETHING_NEW")
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn live_raw_socket_trace() {
+        ghost_live::raw_trace(20);
+    }
+
+    #[test]
+    #[ignore]
+    fn live_watch_a_running_download() {
+        ghost_live::start();
+        for i in 0..25 {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(snaps) = ghost_live::snapshot() else {
+                println!("[{i:02}] 通道还没连上");
+                continue;
+            };
+            let running: Vec<_> = snaps.iter().filter(|(_, s)| s.status != "COMPLETED").collect();
+            if running.is_empty() {
+                println!("[{i:02}] 没有在跑的（共 {} 条）", snaps.len());
+                continue;
+            }
+            for (id, s) in running {
+                println!(
+                    "[{i:02}] {id} | {} | {:.2}% | {}/s | {}/{}",
+                    s.status, s.progress, s.speed, s.received, s.total
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn live_ghost_socket_reports_real_numbers() {
+        ghost_live::start();
+        let mut got = None;
+        for _ in 0..80 {
+            std::thread::sleep(Duration::from_millis(250));
+            if let Some(s) = ghost_live::snapshot() {
+                got = Some(s);
+                break;
+            }
+        }
+        let snaps = got.expect("20 秒内应该收到 Ghost 的 task_snapshot");
+        assert!(!snaps.is_empty(), "Ghost 里至少有任务");
+        println!("=== 实时快照 {} 条 ===", snaps.len());
+        let mut rows: Vec<_> = snaps.iter().collect();
+        rows.sort_by(|a, b| a.1.status.cmp(&b.1.status));
+        for (id, s) in rows.iter().take(8) {
+            println!(
+                "{id} | {:>10} | {:>12} / {:>12} | {:>10}/s | {:.2}",
+                s.status, s.received, s.total, s.speed, s.progress
+            );
         }
     }
 }
