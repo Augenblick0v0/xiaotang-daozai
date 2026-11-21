@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 /// 列表最多画几条。
 const MAX_ITEMS: usize = 12;
 /// 标题最多留多少个字符（按 chars，不按字节）。
-const TITLE_CHARS: usize = 80;
+const TITLE_CHARS: usize = 34;
 /// JSONL 只读尾部这么多字节，往前的历史不碰（Codex 单文件可达几十 MB）。
 const TAIL_BYTES: u64 = 256 * 1024;
 /// 头部读多少字节：会话元信息（cwd、模型、首条提问）都在文件开头，尾部读不到。
@@ -23,6 +23,8 @@ const HEAD_BYTES: u64 = 128 * 1024;
 const LINE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// DSH 的 turn 还开着但没有「正在跑工具」的边界信息时，多久没活动就从「调用工具」降级成「正在思考」。
 const FRESH_MS: i64 = 10_000;
+/// 超过这么久没有任何活动，就不再把那轮会话当成「在跑」（100ns 不适用，这里是毫秒）。
+const STALE_MS: i64 = 120 * 60_000;
 /// 后台扫描节拍。
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -179,6 +181,16 @@ pub fn scan(roots: &Roots, cfg: &ScanConfig) -> Vec<TaskItem> {
     // 同一 id 只留一条（先到先得），再按「等你 → 在跑 → 收场，同档新的在前」排序。
     let mut seen = HashSet::new();
     items.retain(|it| seen.insert(it.id.clone()));
+    for it in &mut items {
+        // 标题洗成空串（会话 id 之类）时退回目录名，总比留一片空白强。
+        if it.title.trim().is_empty() {
+            it.title = if it.project.trim().is_empty() {
+                "未命名会话".to_string()
+            } else {
+                it.project.clone()
+            };
+        }
+    }
     items.sort_by(|a, b| {
         stage_rank(a.stage)
             .cmp(&stage_rank(b.stage))
@@ -186,6 +198,17 @@ pub fn scan(roots: &Roots, cfg: &ScanConfig) -> Vec<TaskItem> {
     });
     items.truncate(MAX_ITEMS);
     items
+}
+
+/// 会话文件还热、可那一轮早就没人看了：再算「在跑」会一直显示「已跑 149 小时」。
+/// 这里只是不把它当成活着（仍然按「已结束」留着，等你点开看一眼）——
+/// 放在扫描之后单独做，纯解析函数 `scan` 就仍然是对时间点无偏的。
+pub fn demote_stale(items: &mut [TaskItem], now_ms: i64) {
+    for it in items.iter_mut() {
+        if it.stage.alive() && now_ms.saturating_sub(it.updated_ms) > STALE_MS {
+            it.stage = Stage::Done;
+        }
+    }
 }
 
 /// 每 2 秒在后台线程扫一次，结果通过通道回传，UI 线程永不阻塞。
@@ -226,7 +249,8 @@ impl Watcher {
         }
         if let Some(rx) = &self.rx {
             match rx.try_recv() {
-                Ok(items) => {
+                Ok(mut items) => {
+                    demote_stale(&mut items, cfg.now_ms);
                     self.items = items;
                     self.rx = None;
                 }
@@ -272,14 +296,26 @@ fn stage_rank(stage: Stage) -> u8 {
 
 /* ---------- 通用小工具 ---------- */
 
-/// 标题：连续空白/换行压成单个空格，去首尾，最多 200 字符。
+/// 标题：连续空白/换行压成单个空格，去掉提问常见的 markdown 前缀，最多 `TITLE_CHARS` 字符。
+/// 会话里能拿来当标题的往往是一整段提问，直接摊在岛上会挤满两行，所以这里先洗一遍。
 fn clean_title(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len().min(4 * TITLE_CHARS));
     let mut pending_space = false;
     let mut count = 0usize;
     for ch in raw.chars() {
+        if ch == '\n' || ch == '\r' {
+            // 只取第一段有内容的行：后面的换行段落通常已经是提问正文了。
+            if !out.is_empty() {
+                break;
+            }
+            continue;
+        }
         if ch.is_whitespace() {
             pending_space = !out.is_empty();
+            continue;
+        }
+        // 行首的引用/列表/标题装饰对标题没有意义。
+        if out.is_empty() && matches!(ch, '#' | '>' | '-' | '*' | '·' | '`') {
             continue;
         }
         if pending_space {
@@ -293,7 +329,32 @@ fn clean_title(raw: &str) -> String {
         out.push(ch);
         count += 1;
     }
-    out.trim_end().to_string()
+    let out = out.trim_end().to_string();
+    // 第一句就是一个链接时（「https://github.com/… 看下这个」），链接本身当标题没有信息量。
+    let out = if out.starts_with("http://") || out.starts_with("https://") {
+        let rest: Vec<&str> = out.split_whitespace().skip(1).collect();
+        if rest.is_empty() {
+            return String::new();
+        }
+        rest.join(" ")
+    } else {
+        out
+    };
+    // 会话 id 当标题是最没用的一种：交给调用方退回项目名。
+    if is_session_id_title(&out) {
+        return String::new();
+    }
+    out
+}
+
+/// `session-6d4a6714-fd2f-4db1-95f1-079a40fc…` 这种是缓存文件名漏进来的，不是标题。
+fn is_session_id_title(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("session-") else {
+        return false;
+    };
+    let hex = rest.chars().filter(|c| *c != '-').count();
+    rest.chars().all(|c| c.is_ascii_hexdigit() || c == '-') && hex >= 16
 }
 
 /// Claude Code 会往 transcript 里塞「伪 user 行」：斜杠命令、IDE 打开文件提示、
@@ -513,8 +574,12 @@ fn parse_dsh(
         .and_then(|v| v.get("first"))
         .and_then(|v| v.get("text"))
         .and_then(Value::as_str);
+    // `title` 行本身也可能就是一句长提问或一个链接（实测见过整条都是 github 地址），
+    // 所以两处都要过一遍 `clean_title`，洗完是空的就交给调用方退回项目名。
     let title = non_empty(title_row)
-        .or_else(|| non_empty(title_input))
+        .map(|t| clean_title(&t))
+        .filter(|t| !t.is_empty())
+        .or_else(|| non_empty(title_input).map(|t| clean_title(&t)).filter(|t| !t.is_empty()))
         .unwrap_or_default();
 
     let metadata = dsh_row(rows, "sessionListMetadata");
@@ -1694,11 +1759,19 @@ mod tests {
 
     #[test]
     fn title_is_collapsed_and_truncated() {
+        // 多段提问只取第一段：后面的段落已经是正文，摊到岛上没有意义。
         let long = format!("  a\n\n\tb   {}", "字".repeat(400));
-        let title = clean_title(&long);
-        assert!(title.starts_with("a b 字"));
+        assert_eq!(clean_title(&long), "a");
+        // 单行太长时按 TITLE_CHARS 截断，行内空白压成一个空格。
+        let one_line = format!("a  b   {}", "字".repeat(400));
+        let title = clean_title(&one_line);
+        assert!(title.starts_with("a b 字"), "{title}");
         assert_eq!(title.chars().count(), TITLE_CHARS);
         assert_eq!(clean_title("  \n  "), "");
+        // 会话 id、纯链接都不当标题，交给调用方退回项目名。
+        assert_eq!(clean_title("session-6d4a6714-fd2f-4db1-95f1-079a40fc1234"), "");
+        assert_eq!(clean_title("https://github.com/Renly1994/xiaotang-daozai"), "");
+        assert_eq!(clean_title("https://example.com/a 看下这个"), "看下这个");
     }
 
     #[test]

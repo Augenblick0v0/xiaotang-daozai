@@ -9381,6 +9381,40 @@ fn ai_task_page_gallery(){
     shoot(&mut h,&mut r,"ai-task-empty");
 }
 
+/// 用本机真实会话记录出图（#\[ignore\]，不进 CI）：验证「扫描本机 → 页面」整条链路。
+#[test]
+#[ignore]
+fn ai_task_page_live_gallery(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let dest=std::path::PathBuf::from(std::env::var_os("DAOZAI_FEATURE_PREVIEW_DIR").expect("需指定预览目录"));std::fs::create_dir_all(&dest).unwrap();
+    let mut h=H::new();h.app.settings.pet=false;
+    h.app.settings.task_sources=[true;3];
+    h.app.settings.task_keep_minutes=240;
+    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let cfg=crate::task_scan::ScanConfig{sources:[true;3],keep_minutes:240,now_ms:now};
+    let mut items=crate::task_scan::scan(&crate::task_scan::Roots::real(),&cfg);
+    crate::task_scan::demote_stale(&mut items,now);
+    eprintln!("真实任务 {} 条",items.len());
+    for it in &items{eprintln!("  [{}] {} · {} · {} · 进度 {:?} · {}",it.source.short(),it.stage.label(),it.model,it.project,it.progress,it.title);}
+    h.app.task.inject(items);
+    h.app.show_page(crate::app::TASK_PAGE);
+    for _ in 0..90{h.frame(vec![]);}
+    let ppp=2.0;
+    let mut r=feature_raster();
+    let env=Env{t:h.t,clock:"09:41:00".into(),today:"2026-11-05".into(),date:"11月5日 周四".into(),battery:Some(76),bt_ready:true,..Default::default()};
+    let raw=egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(crate::app::CANVAS_W,WIN_H))),time:Some(h.t),focused:true,
+        viewports:std::iter::once((egui::ViewportId::ROOT,egui::ViewportInfo{native_pixels_per_point:Some(ppp),..Default::default()})).collect(),..Default::default()};
+    let app=&mut h.app;
+    let output=h.ctx.run(raw,|ctx|{egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx,|ui|{let win=Rect::from_min_size(ui.max_rect().min,Vec2::new(WIN_W,WIN_H));app.frame(ui,win,&env);});});
+    r.update_textures(&output.textures_delta);
+    r.buf.fill([0.16,0.18,0.24,1.0]);
+    r.draw(&h.ctx.tessellate(output.shapes,output.pixels_per_point),output.pixels_per_point);
+    let mut rgba=Vec::new();r.to_rgba8(&mut rgba);
+    let image=image::RgbaImage::from_raw((crate::app::CANVAS_W*ppp) as u32,(WIN_H*ppp) as u32,rgba).unwrap();
+    image::imageops::crop_imm(&image,0,0,(WIN_W*ppp) as u32,(WIN_H*ppp) as u32).to_image().save(dest.join("ai-task-live.png")).unwrap();
+    r.free_textures(&output.textures_delta);
+}
+
 /// 设置页的 AI 额度账号默认收起成一行；需要检查明细的测试先把所有账号展开。
 pub(crate) fn open_quota_details(h:&H){
     for account in &h.app.quota.config.accounts {h.ctx.data_mut(|d|d.insert_temp(egui::Id::new(("quota-account-open",account.id.clone())),true));}

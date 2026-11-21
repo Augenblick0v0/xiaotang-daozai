@@ -73,17 +73,21 @@ impl App {
             } else {
                 theme::WHITE
             };
-            let row = c.hit(12.0, y - 6.0, PW - 24.0, ROW_H - 4.0, ("task-row", task.id.as_str()));
+            // 左边给翻页箭头留一条空档：它画在页高正中，正好压在行首。
+            let row = c.hit(40.0, y - 6.0, PW - 52.0, ROW_H - 4.0, ("task-row", task.id.as_str()));
             let (hover, _) = c.hover_t(&row);
             if hover > 0.01 {
-                c.fill(12.0, y - 6.0, PW - 24.0, ROW_H - 4.0, 8.0, Color32::from_white_alpha((hover * 10.0) as u8));
+                c.fill(40.0, y - 6.0, PW - 52.0, ROW_H - 4.0, 8.0, Color32::from_white_alpha((hover * 10.0) as u8));
             }
-            source_logo(c, task.source, 27.0, y + 11.0, 16.0);
-            let title = c.fit(&task.title, 12.0, W::Semibold, PW - 146.0);
-            c.text(44.0, y + 10.0, &title, 12.0, W::Semibold, accent, H::Left);
-            let sub = subtitle(task, now, self.settings.task_hide_project);
-            let sub = c.fit(&sub, 10.0, W::Regular, PW - 146.0);
-            c.text(44.0, y + 25.0, &sub, 10.0, W::Regular, theme::GRAY, H::Left);
+            source_logo(c, task.source, 52.0, y + 11.0, 16.0);
+            let text_x = 68.0;
+            let text_w = PW - 64.0 - text_x - 12.0;
+            let title = c.fit(&task.title, 12.0, W::Semibold, text_w);
+            c.text(text_x, y + 10.0, &title, 12.0, W::Semibold, accent, H::Left);
+            // 标题已经退回到项目名时，副标题里就别再重复一遍。
+            let hide_project = self.settings.task_hide_project || task.project == task.title;
+            let sub = fitted_subtitle(c, task, now, hide_project, text_w);
+            c.text(text_x, y + 25.0, &sub, 10.0, W::Regular, theme::GRAY, H::Left);
             ring(c, task, PW - 64.0, y + 11.0, self.t as f32);
             let tip = match &task.log {
                 Some(log) => format!("{}｜{}｜点击打开会话记录", task.source.label(), subtitle(task, now, self.settings.task_hide_project)),
@@ -162,15 +166,19 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 「2 分 10 秒」这种给人看的时长。
+/// 「2 分 10 秒」这种给人看的时长；一行位置有限，超过一天就只说天数。
 fn age_text(ms: i64) -> String {
     let seconds = (ms.max(0) / 1000) as u64;
     if seconds < 60 {
         format!("{seconds} 秒")
-    } else if seconds < 3600 {
+    } else if seconds < 600 {
         format!("{} 分 {} 秒", seconds / 60, seconds % 60)
+    } else if seconds < 3600 {
+        format!("{} 分", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{} 小时", seconds / 3600)
     } else {
-        format!("{} 小时 {} 分", seconds / 3600, (seconds % 3600) / 60)
+        format!("{} 天", seconds / 86_400)
     }
 }
 
@@ -191,6 +199,7 @@ fn ago_text(ms: i64) -> String {
 }
 
 /// 第二行：阶段 · 模型 · 项目 · 用时/速度。
+/// 一行放不下时从末尾往前丢（速度 → 项目 → 模型），阶段永远留着。
 fn subtitle(task: &TaskItem, now: i64, hide_project: bool) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(5);
     parts.push(task.stage.label().to_string());
@@ -204,7 +213,7 @@ fn subtitle(task: &TaskItem, now: i64, hide_project: bool) -> String {
         // 等你的时长比「跑了多久」更有用：它反映拖了多久没处理。
         parts.push(format!("已等 {}", age_text(now - task.updated_ms)));
     } else if task.stage.alive() {
-        parts.push(format!("已跑 {}", age_text(now - task.started_ms)));
+        parts.push(alive_text(task, now));
         if task.rate >= 1.0 {
             parts.push(format!("{:.0} tok/s", task.rate));
         }
@@ -215,6 +224,60 @@ fn subtitle(task: &TaskItem, now: i64, hide_project: bool) -> String {
         }
     }
     parts.join(" · ")
+}
+
+/// 「已跑 3 分」；遇到一轮开了好几天、其实还在动的会话，说「N 分钟前更新」更实在。
+fn alive_text(task: &TaskItem, now: i64) -> String {
+    let running = now - task.started_ms;
+    if running > 12 * 3600 * 1000 {
+        format!("{}更新", ago_text(now - task.updated_ms))
+    } else {
+        format!("已跑 {}", age_text(running))
+    }
+}
+
+/// 按宽度挑一个放得下的副标题：从最长的组合开始，放不下就丢掉最靠后的部分。
+fn fitted_subtitle(c: &Card, task: &TaskItem, now: i64, hide_project: bool, max_w: f32) -> String {
+    let full = subtitle(task, now, hide_project);
+    if c.text_w(&full, 10.0, W::Regular) <= max_w {
+        return full;
+    }
+    // 结尾那一段（速度/词元数）最先丢，其次是项目名，最后连模型也去掉，只留阶段。
+    let mut keep_project = !hide_project;
+    let mut keep_model = true;
+    loop {
+        let trimmed = subtitle_parts(task, now, keep_project && !task.project.is_empty(), keep_model).join(" · ");
+        if c.text_w(&trimmed, 10.0, W::Regular) <= max_w {
+            return trimmed;
+        }
+        if keep_project {
+            keep_project = false;
+        } else if keep_model && !task.model.is_empty() {
+            keep_model = false;
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+/// 副标题的各段，去掉末尾的「速度/词元」段（那一段在窄行里最先牺牲）。
+fn subtitle_parts(task: &TaskItem, now: i64, with_project: bool, with_model: bool) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    parts.push(task.stage.label().to_string());
+    if with_model && !task.model.is_empty() {
+        parts.push(task.model.clone());
+    }
+    if with_project && !task.project.is_empty() {
+        parts.push(task.project.clone());
+    }
+    if task.stage.needs_user() {
+        parts.push(format!("已等 {}", age_text(now - task.updated_ms)));
+    } else if task.stage.alive() {
+        parts.push(alive_text(task, now));
+    } else {
+        parts.push(format!("{}结束", ago_text(now - task.updated_ms)));
+    }
+    parts
 }
 
 /// 右侧圆环：有真实进度画进度，没有就画一段转圈的弧。
