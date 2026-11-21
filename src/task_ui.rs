@@ -1,7 +1,8 @@
 //! 「AI 任务」页：把本机 Codex / Claude / DeepSeek 会话正在做的东西搬上岛。
 //!
 //! 数据全部来自本机已经落盘的会话记录（`task_scan` 只读文件、不联网），
-//! 进度只在能真实算出来时才画（DSH 的 todo 完成率），否则画一段转圈的弧，
+//! 进度只在能真实算出来时才画：DeepSeek 的待办、Codex 的 `update_plan`、
+//! Claude 的 `TodoWrite` 都算「客户端自己报上来的计划」，拿不到就画一段转圈的弧，
 //! 不假装知道百分比——「不知道」比「编一个」有用。
 use crate::app::*;
 use crate::paint::{self, Card, H};
@@ -148,8 +149,10 @@ impl App {
             ui.label(
                 egui::RichText::new(
                     "岛仔只读本机已经写好的会话记录，不联网、不上传。\
-                     进度只在能真实算出来时显示（会话里的待办完成率），其余显示成转圈的弧，\
-                     不猜百分比。需要你回复或确认的会话标成琥珀色。",
+                     进度来自客户端自己报的待办清单：DeepSeek Harness 的待办、\
+                     Codex 的 update_plan、Claude Code 的 TodoWrite；\
+                     客户端没报计划时就显示成转圈的弧，不猜百分比。\
+                     需要你回复或确认的会话标成琥珀色。",
                 )
                 .size(11.5)
                 .color(Color32::from_gray(155)),
@@ -203,6 +206,10 @@ fn ago_text(ms: i64) -> String {
 fn subtitle(task: &TaskItem, now: i64, hide_project: bool) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(5);
     parts.push(task.stage.label().to_string());
+    // 8.5 点的圆环看不清百分比，有真实进度时顺手写在阶段后面。
+    if let Some(progress) = live_progress(task) {
+        parts.push(percent_text(progress));
+    }
     if !task.model.is_empty() {
         parts.push(task.model.clone());
     }
@@ -224,6 +231,21 @@ fn subtitle(task: &TaskItem, now: i64, hide_project: bool) -> String {
         }
     }
     parts.join(" · ")
+}
+
+/// 「62%」：客户端报的完成比例。
+fn percent_text(progress: f32) -> String {
+    format!("{:.0}%", progress.clamp(0.0, 1.0) * 100.0)
+}
+
+/// 只有还在跑/还在等你的时候才拿计划进度来说事：已经结束的会话留着上一次的 10%，
+/// 说「已完成 · 10%」只会让人觉得没做完。
+fn live_progress(task: &TaskItem) -> Option<f32> {
+    if task.stage.alive() || task.stage.needs_user() {
+        task.progress
+    } else {
+        None
+    }
 }
 
 /// 「已跑 3 分」；遇到一轮开了好几天、其实还在动的会话，说「N 分钟前更新」更实在。
@@ -264,6 +286,9 @@ fn fitted_subtitle(c: &Card, task: &TaskItem, now: i64, hide_project: bool, max_
 fn subtitle_parts(task: &TaskItem, now: i64, with_project: bool, with_model: bool) -> Vec<String> {
     let mut parts: Vec<String> = Vec::with_capacity(4);
     parts.push(task.stage.label().to_string());
+    if let Some(progress) = live_progress(task) {
+        parts.push(percent_text(progress));
+    }
     if with_model && !task.model.is_empty() {
         parts.push(task.model.clone());
     }
@@ -293,7 +318,7 @@ fn ring(c: &Card, task: &TaskItem, cx: f32, cy: f32, t: f32) {
         Color32::from_white_alpha(90)
     };
     c.ring(cx, cy, radius, 2.0, Color32::from_white_alpha(24));
-    match task.progress {
+    match live_progress(task) {
         Some(progress) => {
             let progress = progress.clamp(0.0, 1.0);
             if progress > 0.002 {
@@ -349,4 +374,37 @@ fn source_texture(ctx: &egui::Context, source: Source, pixels: u32) -> Option<eg
     crate::skin_paint::mark_monochrome(texture.id());
     ctx.data_mut(|data| data.insert_temp(key, texture.clone()));
     Some(texture)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task_scan::{Source, Stage};
+
+    fn task(stage: Stage, progress: Option<f32>) -> TaskItem {
+        TaskItem {
+            id: "codex:demo".into(),
+            source: Source::Codex,
+            title: "写解析器".into(),
+            project: "demo".into(),
+            model: "gpt-6.2-sol".into(),
+            stage,
+            progress,
+            started_ms: 0,
+            updated_ms: 0,
+            output_tokens: 0,
+            rate: 0.0,
+            log: None,
+        }
+    }
+
+    #[test]
+    fn progress_shows_while_alive_and_hides_once_done() {
+        let now = 60_000;
+        let running = subtitle(&task(Stage::Tool, Some(0.62)), now, false);
+        assert!(running.contains("62%"), "{running}");
+        // 收场后计划可能还停在 60%：说「已完成 · 62%」会让人以为没做完。
+        let done = subtitle(&task(Stage::Done, Some(0.62)), now, false);
+        assert!(!done.contains("62%"), "{done}");
+    }
 }

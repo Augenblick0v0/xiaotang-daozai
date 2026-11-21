@@ -821,6 +821,18 @@ enum TailKind {
     Thinking,
 }
 
+/// 待办清单的完成率：只有真有条目时才给百分比，空清单不许瞎估。
+fn todo_progress(list: &[Value]) -> Option<f32> {
+    if list.is_empty() {
+        return None;
+    }
+    let done = list
+        .iter()
+        .filter(|step| step.get("status").and_then(Value::as_str) == Some("completed"))
+        .count();
+    Some(done as f32 / list.len() as f32)
+}
+
 fn parse_codex(path: &Path, mtime: i64) -> Option<TaskItem> {
     // 只读尾部：单文件几十 MB，整读会卡住扫描线程。
     let text = read_window(path)?;
@@ -836,6 +848,7 @@ fn parse_codex(path: &Path, mtime: i64) -> Option<TaskItem> {
     let mut last_response_ms: Option<i64> = None;
     let mut output_tokens: u64 = 0;
     let mut rate: f32 = 0.0;
+    let mut progress: Option<f32> = None;
     let mut prev_usage: Option<(i64, u64)> = None;
     let mut saw_event = false;
 
@@ -936,7 +949,23 @@ fn parse_codex(path: &Path, mtime: i64) -> Option<TaskItem> {
                 last_response_ms = ts.or(last_response_ms);
                 match payload.get("type").and_then(Value::as_str).unwrap_or("") {
                     "reasoning" => tail_kind = Some(TailKind::Thinking),
-                    "function_call" | "custom_tool_call" => tail_kind = Some(TailKind::Tool),
+                    "function_call" | "custom_tool_call" => {
+                        // Codex 用 update_plan 上报待办清单，arguments 是字符串形式的 JSON。
+                        if payload.get("name").and_then(Value::as_str) == Some("update_plan") {
+                            if let Some(parsed) = payload
+                                .get("arguments")
+                                .and_then(Value::as_str)
+                                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                            {
+                                if let Some(plan) = parsed.get("plan").and_then(Value::as_array) {
+                                    if let Some(value) = todo_progress(plan) {
+                                        progress = Some(value);
+                                    }
+                                }
+                            }
+                        }
+                        tail_kind = Some(TailKind::Tool);
+                    }
                     // 与规格一致：其余响应项（含 message / 工具输出）都按工具阶段算。
                     _ => tail_kind = Some(TailKind::Tool),
                 }
@@ -996,8 +1025,7 @@ fn parse_codex(path: &Path, mtime: i64) -> Option<TaskItem> {
         project,
         model: model.unwrap_or_default(),
         stage,
-        // 只有能算出真实进度时才给（Codex 的 rollout 里没有可用的分母）。
-        progress: None,
+        progress,
         started_ms: last_started_ms.or(complete_ms).unwrap_or(mtime),
         updated_ms: last_ts_ms.unwrap_or(mtime),
         output_tokens,
@@ -1097,6 +1125,7 @@ fn parse_claude(path: &Path, stem: &str, mtime: i64) -> Option<TaskItem> {
     let mut last_ts: Option<i64> = None;
     // 末尾是不是一条「用户在说话」的行（新一轮已经发出、模型还没答）。
     let mut tail_is_user = false;
+    let mut progress: Option<f32> = None;
 
     for line in text.lines() {
         let line = line.trim();
@@ -1188,6 +1217,18 @@ fn parse_claude(path: &Path, stem: &str, mtime: i64) -> Option<TaskItem> {
                             if let Some(id) = part.get("id").and_then(Value::as_str) {
                                 pending_tools.insert(id.to_string());
                             }
+                            // Claude 用 TodoWrite 维护待办，input.todos 里带每条状态。
+                            if part.get("name").and_then(Value::as_str) == Some("TodoWrite") {
+                                if let Some(list) = part
+                                    .get("input")
+                                    .and_then(|input| input.get("todos"))
+                                    .and_then(Value::as_array)
+                                {
+                                    if let Some(value) = todo_progress(list) {
+                                        progress = Some(value);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1235,8 +1276,7 @@ fn parse_claude(path: &Path, stem: &str, mtime: i64) -> Option<TaskItem> {
         project,
         model: model.unwrap_or_default(),
         stage,
-        // Claude 的 transcript 里没有可用的任务分母。
-        progress: None,
+        progress,
         started_ms: last_user_ts.or(first_ts).or(last_ts).unwrap_or(mtime),
         updated_ms: last_ts.unwrap_or(mtime),
         output_tokens,
@@ -1613,6 +1653,107 @@ mod tests {
         let items = scan(&roots, &cfg);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].stage, Stage::Tool);
+    }
+
+    #[test]
+    fn codex_update_plan_gives_real_progress() {
+        // 真实 rollout 里 update_plan 的 arguments 是字符串形式的 JSON，不能当对象读。
+        let now = now_ms();
+        let plan = serde_json::json!({
+            "timestamp": "2026-11-20T13:43:02.000Z",
+            "ordinal": 6,
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "update_plan",
+                "arguments": serde_json::json!({
+                    "plan": [
+                        {"step": "读仓库结构", "status": "completed"},
+                        {"step": "写解析器", "status": "in_progress"},
+                        {"step": "补测试", "status": "pending"}
+                    ]
+                }).to_string(),
+                "call_id": "call_plan_1"
+            }
+        });
+        let roots = codex_roots("codex-plan", &codex_lines(&codex_line(plan)));
+        let cfg = ScanConfig {
+            sources: all_on(),
+            keep_minutes: 30,
+            now_ms: now,
+        };
+        let items = scan(&roots, &cfg);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(
+            items[0].progress,
+            Some(1.0 / 3.0),
+            "completed 占全部步骤的比例就是进度"
+        );
+    }
+
+    #[test]
+    fn claude_todo_write_gives_real_progress() {
+        let now = now_ms();
+        let root = temp_root("claude-todos");
+        let claude = root.join("claude");
+        let file = claude
+            .join("projects")
+            .join("d--proj-demo")
+            .join("44444444-5555-6666-7777-888888888888.jsonl");
+        let mut body = String::new();
+        body.push_str(
+            &serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-11-20T10:00:00.000Z",
+                "isSidechain": false,
+                "cwd": "D:\\proj\\demo_project",
+                "sessionId": "44444444-5555-6666-7777-888888888888",
+                "message": {"role": "user", "content": "把设置页拆一下"}
+            })
+            .to_string(),
+        );
+        body.push('\n');
+        body.push_str(
+            &serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-11-20T10:00:05.000Z",
+                "isSidechain": false,
+                "cwd": "D:\\proj\\demo_project",
+                "sessionId": "44444444-5555-6666-7777-888888888888",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-5",
+                    "stop_reason": "tool_use",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_todo_1",
+                        "name": "TodoWrite",
+                        "input": {"todos": [
+                            {"content": "读设置页", "status": "completed", "activeForm": "读设置页"},
+                            {"content": "拆组件", "status": "completed", "activeForm": "拆组件"},
+                            {"content": "补测试", "status": "pending", "activeForm": "补测试"},
+                            {"content": "跑验证", "status": "pending", "activeForm": "跑验证"}
+                        ]}
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        body.push('\n');
+        write_file(&file, &body);
+        let roots = Roots {
+            dsh: root.join("dsh"),
+            codex: root.join("codex"),
+            claude,
+        };
+        let cfg = ScanConfig {
+            sources: all_on(),
+            keep_minutes: 30,
+            now_ms: now,
+        };
+        let items = scan(&roots, &cfg);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].progress, Some(0.5), "TodoWrite 的完成比例就是进度");
     }
 
     #[test]
