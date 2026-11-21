@@ -36,6 +36,16 @@ pub enum Source {
 }
 
 impl Source {
+    /// 点开任务时要抬到前台的客户端可执行文件名（全名，比较时不区分大小写）。
+    /// Claude Code 是终端里的命令行，没有自己的窗口，返回 None。
+    pub fn window_exe(self) -> Option<&'static str> {
+        match self {
+            Source::Dsh => Some("DeepSeek Harness.exe"),
+            Source::Codex => Some("codex.exe"),
+            Source::Claude => None,
+        }
+    }
+
     pub fn key(self) -> &'static str {
         match self {
             Source::Dsh => "dsh",
@@ -122,7 +132,11 @@ pub struct TaskItem {
     pub stage: Stage,
     /// 0.0..=1.0；只有能真实算出来时才 `Some`。
     pub progress: Option<f32>,
+    /// 本轮（或当前这一步）的起点。岛上「已跑」只按这个算，不要拿会话创建时间。
     pub started_ms: i64,
+    /// 本轮已经跑了多久（毫秒）。收场之后仍然有用：岛上会说「本轮 1 分 51 秒」。
+    /// 算不出来给 0。
+    pub turn_ms: i64,
     pub updated_ms: i64,
     pub output_tokens: u64,
     /// token/秒，拿不到 0.0。
@@ -627,7 +641,34 @@ fn parse_dsh(
         .unwrap_or(false);
 
     let updated_ms = last_msg.map(|t| t.max(mtime)).unwrap_or(mtime);
-    let started_ms = created.unwrap_or(mtime);
+    // 会话可能开了好几天，「已跑」必须按**本轮**算：DSH 自己的「深度求索中，用时 X」是从这一轮
+    // 的提问时间算起的，那个时间在 sessionListMetadata.lastPromptAt 里。
+    // 别用 lastTurnInjectionTime / openStep.startTime 当起点：那两个是**每一步**都会刷新的
+    // 事件时间，拿它们计时会把跑了半小时的一轮说成刚跑十分钟。
+    let turn_start = metadata
+        .and_then(|v| v.get("lastPromptAt"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            time_context
+                .and_then(|v| v.get("lastTurnInjectionTime"))
+                .and_then(Value::as_i64)
+        })
+        .or_else(|| {
+            dsh_row(rows, "sessionStats")
+                .and_then(|v| v.get("openStep"))
+                .and_then(|v| v.get("startTime"))
+                .and_then(Value::as_i64)
+        })
+        .or_else(|| {
+            time_context
+                .and_then(|v| v.get("lastInjectionTime"))
+                .and_then(Value::as_i64)
+        })
+        .or(created);
+    let started_ms = turn_start.unwrap_or(mtime);
+    // 本轮还没关就用「现在」当终点，关了就用到最后一条消息的时间。
+    let turn_end = if open_turn { now_ms } else { updated_ms };
+    let turn_ms = turn_end.saturating_sub(started_ms).max(0);
 
     // 推断（真实数据里没采到样本）：openStep.pendingCalls 里出现"等审批"字样的条目 ⇒ 在等你确认。
     let awaiting_approval = dsh_row(rows, "sessionStats")
@@ -641,31 +682,27 @@ fn parse_dsh(
         })
         .unwrap_or(false);
 
+    // 阶段只认「这一轮开了没有」这一个硬信号：`openTurnStartSeq` 有值就是这一轮还没结束。
+    // 之前拿 lastStepBoundary.kind 推，步骤收尾但轮次还开着时会被说成「调用工具 · 已跑 52 分」，
+    // 实际那一轮早就跑完了。
     let stage = if question_active {
         Stage::WaitingInput
     } else if awaiting_approval {
         Stage::WaitingApproval
-    } else if kind == "start" {
-        Stage::Tool
     } else if open_turn {
-        // turn 没关但还不知道是不是在跑工具：刚有动静算调用工具，久没动静算思考。
+        // 刚有动静算在调工具，久没动静算在思考；两种情况都还在这一轮里。
         if now_ms.saturating_sub(updated_ms) <= FRESH_MS {
             Stage::Tool
         } else {
             Stage::Thinking
         }
-    } else if kind == "end" {
-        // 步骤收尾了：turn 也关了才算结束，还开着就是下一轮马上来。
-        if turn_open {
-            Stage::Thinking
-        } else {
-            Stage::Done
-        }
     } else if turn_open {
+        // 轮次已收尾但审批状态还开着：还在等下一轮。
         Stage::Thinking
     } else {
         Stage::Done
     };
+    let _ = kind;
 
     let progress = dsh_row(rows, "todos")
         .and_then(Value::as_array)
@@ -688,12 +725,6 @@ fn parse_dsh(
         .to_string();
 
     let stats = dsh_row(rows, "sessionStats");
-    // 会话可能已经开了好几天，「已跑」要按当前这一步算才看得懂。
-    let started_ms = stats
-        .and_then(|v| v.get("openStep"))
-        .and_then(|v| v.get("startTime"))
-        .and_then(Value::as_i64)
-        .unwrap_or(started_ms);
     let output_tokens = dsh_row(rows, "tokenUsage")
         .and_then(|v| v.get("totals"))
         .and_then(|v| v.get("outputTokens"))
@@ -730,6 +761,7 @@ fn parse_dsh(
         stage,
         progress,
         started_ms,
+        turn_ms,
         updated_ms,
         output_tokens,
         rate,
@@ -1027,6 +1059,14 @@ fn parse_codex(path: &Path, mtime: i64) -> Option<TaskItem> {
         stage,
         progress,
         started_ms: last_started_ms.or(complete_ms).unwrap_or(mtime),
+        turn_ms: {
+            // 这一轮从 task_started 到 task_complete（或最后一条事件）的时长。
+            let end = complete_ms.or(last_ts_ms).unwrap_or(mtime);
+            match last_started_ms {
+                Some(start) => end.saturating_sub(start).max(0),
+                None => 0,
+            }
+        },
         updated_ms: last_ts_ms.unwrap_or(mtime),
         output_tokens,
         rate: if rate.is_finite() && rate >= 0.0 {
@@ -1278,6 +1318,14 @@ fn parse_claude(path: &Path, stem: &str, mtime: i64) -> Option<TaskItem> {
         stage,
         progress,
         started_ms: last_user_ts.or(first_ts).or(last_ts).unwrap_or(mtime),
+        turn_ms: {
+            // Claude 的 transcript 只有「真人提问 → 最后一条消息」这两端，差值就是这一轮耗时。
+            let start = last_user_ts.or(first_ts);
+            match (start, last_ts) {
+                (Some(start), Some(end)) => end.saturating_sub(start).max(0),
+                _ => 0,
+            }
+        },
         updated_ms: last_ts.unwrap_or(mtime),
         output_tokens,
         rate: 0.0,
@@ -1891,6 +1939,7 @@ mod tests {
             stage,
             progress: None,
             started_ms: updated,
+            turn_ms: 0,
             updated_ms: updated,
             output_tokens: 0,
             rate: 0.0,
@@ -1949,10 +1998,11 @@ mod tests {
                 .unwrap_or_else(|| "无".to_string());
             let idle_min = now.saturating_sub(it.updated_ms) / 60_000;
             println!(
-                "{} {:<6} 进度={:<4} {:>6.1}t/s {:>7}tok 更新={}分钟前 | {} | {} | {} | {}",
+                "{} {:<6} 进度={:<4} 本轮={:>4.1}分 {:>6.1}t/s {:>7}tok 更新={}分钟前 | {} | {} | {} | {}",
                 it.source.short(),
                 it.stage.label(),
                 progress,
+                it.turn_ms as f64 / 60_000.0,
                 it.rate,
                 it.output_tokens,
                 idle_min,

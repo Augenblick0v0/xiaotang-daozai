@@ -336,9 +336,88 @@ pub fn open_uri(uri: &str) -> bool {
     result.0 as isize > 32
 }
 
+/// 把某个 exe 的主窗口抬到前台。AI 任务行点开的「回到客户端」就靠它：
+/// 会话日志本身不用打开，用户要的是那个 harness 窗口。
+/// 只挑可见、非工具窗、面积最大的窗口；`exe_name` 不区分大小写的全名匹配。
+pub fn focus_process_window(exe_name: &str) -> bool {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{BOOL, CloseHandle};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_MENU};
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    struct Find {
+        wanted: String,
+        best: Option<(HWND, i64)>,
+    }
+
+    unsafe extern "system" fn visit(hwnd: HWND, lp: LPARAM) -> BOOL {
+        let find = &mut *(lp.0 as *mut Find);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+        if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32) & WS_EX_TOOLWINDOW.0 != 0 {
+            return BOOL(1);
+        }
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return BOOL(1);
+        }
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return BOOL(1);
+        };
+        let mut buffer = [0u16; 1024];
+        let mut length = buffer.len() as u32;
+        let read = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        );
+        let _ = CloseHandle(process);
+        if read.is_err() {
+            return BOOL(1);
+        }
+        let path = String::from_utf16_lossy(&buffer[..length as usize]).to_lowercase();
+        if !path.ends_with(&find.wanted) {
+            return BOOL(1);
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return BOOL(1);
+        }
+        let area = (rect.right - rect.left) as i64 * (rect.bottom - rect.top) as i64;
+        if area <= 0 {
+            return BOOL(1);
+        }
+        if find.best.is_none_or(|(_, best)| area > best) {
+            find.best = Some((hwnd, area));
+        }
+        BOOL(1)
+    }
+
+    let mut find = Find { wanted: exe_name.to_lowercase(), best: None };
+    unsafe {
+        let _ = EnumWindows(Some(visit), LPARAM((&mut find as *mut Find) as isize));
+    }
+    let Some((hwnd, _)) = find.best else {
+        return false;
+    };
+    unsafe {
+        let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+        // 前台锁：系统只放行「刚收到过键盘输入」的进程抢前台，所以先点一下 Alt 再抬。
+        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_EXTENDEDKEY, 0);
+        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        let _ = BringWindowToTop(hwnd);
+        let raised = SetForegroundWindow(hwnd).as_bool();
+        raised || IsWindowVisible(hwnd).as_bool()
+    }
+}
+
 /// winit 会在显示/改属性时重写窗口样式，所以每帧按需兜一次底。
-unsafe fn apply_style(hwnd: HWND, editing: bool, raise: bool) {
-    let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+unsafe fn apply_style(hwnd: HWND, editing: bool, raise: bool) {    let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     let want = (style | WS_POPUP.0 as isize)
         & !((WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0)
             as isize);

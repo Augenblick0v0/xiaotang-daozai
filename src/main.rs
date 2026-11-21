@@ -761,6 +761,20 @@ impl eframe::App for Shell {
                 },
                 Cmd::DisconnectNotifications=>{#[cfg(windows)]{self.incoming=None;self.app.settings.read_notifications=false;self.app.settings.save();self.app.listener_status="已断开，不再读取 Windows 通知".into();}},
                 Cmd::Reveal(p)=>{let _=daozai::child_process::spawn(std::process::Command::new("explorer.exe").arg(format!("/select,{}",p.display())));},
+                Cmd::OpenTask(source,log)=>{
+                    #[cfg(windows)]
+                    let focused=source.window_exe().is_some_and(|exe| daozai::native::focus_process_window(exe));
+                    #[cfg(not(windows))]
+                    let focused=false;
+                    if focused {
+                        // 已经跳到那个客户端了，日志不用再打开。
+                    } else if let Some(p)=log {
+                        let _=daozai::child_process::spawn(std::process::Command::new("explorer.exe").arg(format!("/select,{}",p.display())));
+                        self.app.say(format!("没找到{}窗口，已打开会话记录",source.label()));
+                    } else {
+                        self.app.say(format!("没找到{}窗口",source.label()));
+                    }
+                },
                 Cmd::QuotaChooseFile=>{
                     #[cfg(windows)] match daozai::system::pick_files_for("选择 AI 账号的登录 JSON 文件",false){Ok(files)=>if let Some(path)=files.into_iter().next(){self.app.quota_set_source(path);},Err(_)=>self.app.say("无法选择登录文件")}
                 },

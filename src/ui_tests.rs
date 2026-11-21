@@ -9365,7 +9365,7 @@ fn ai_task_page_gallery(){
     let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
     let item=|id:&str,source:Source,title:&str,project:&str,model:&str,stage:Stage,progress:Option<f32>,mins:i64|TaskItem{
         id:id.into(),source,title:title.into(),project:project.into(),model:model.into(),stage,progress,
-        started_ms:now-mins*60_000,updated_ms:now-30_000,output_tokens:41230,rate:96.4,log:None};
+        started_ms:now-mins*60_000,updated_ms:now-30_000,turn_ms:mins*60_000,output_tokens:41230,rate:96.4,log:None};
     h.app.task.inject(vec![
         item("dsh:1",Source::Dsh,"把任务进度搬上岛","Daozai_fork","deepseek-v4.1-flash",Stage::WaitingApproval,Some(0.62),12),
         item("codex:2",Source::Codex,"挑选素材视频并单独放一个文件夹","未命名 2","gpt-6.2-sol",Stage::Tool,None,7),
