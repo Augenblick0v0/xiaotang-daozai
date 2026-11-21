@@ -3026,32 +3026,39 @@ impl App {
         }
         // 收起态岛角标：当前 AI 任务的 token 速度 + 完成进度（`[环][173 t/s]`）。
         // 只在收起、非极简、对应设置打开时画；展开后任务页本身有更完整的呈现。
-        if self.island_badge_reserve() > 0.0 {
+        // 歌词占着药丸（它比常驻内容宽得多）时不画：那会儿药丸的左边缘是封面和歌词，
+        // 角标压上去只会糊成一片，等歌词退场自然就回来了。
+        let badge_quiet = lyric_alpha <= 0.003
+            && !self.island_lyrics_active()
+            && self.notice.is_none()
+            && !self.hud_notice.as_ref().is_some_and(|a| a.is_hud());
+        if self.island_badge_reserve() > 0.0 && badge_quiet {
             if let Some(badge)=self.island_badge() {
-                // 从药丸左边距 8 点起步往右排：环在左、字在右。
-                let left=local_cx-self.w.pos/2.0+8.0;
                 let ring_r=5.5;
-                let mut x=left;
-                if self.settings.task_island_progress {
-                    if let Some(progress)=badge.progress {
-                        let center=(x+ring_r,BAR_H/2.0);
-                        base.ring(center.0,center.1,ring_r,2.0,theme::DIM);
-                        let sweep=progress.clamp(0.0,1.0);
-                        if sweep>0.002 {
-                            base.arc(center.0,center.1,ring_r,-FRAC_PI_2,-FRAC_PI_2+TAU*sweep,2.0,theme::SOFT_GREEN);
-                        }
-                        x+=ring_r*2.0+4.0;
+                let ring_w=ring_r*2.0+4.0;
+                let rate=self.settings.task_island_speed && badge.rate>=1.0;
+                let text=if rate {
+                    if badge.rate>=1000.0 {format!("{:.1}k t/s",badge.rate/1000.0)}else{format!("{:.0} t/s",badge.rate)}
+                } else {String::new()};
+                let progress=self.settings.task_island_progress.then_some(badge.progress).flatten();
+                // 右对齐贴在常驻内容左边：常驻布局以药丸中心居中，它的墨水从
+                // `local_cx - layout.width/2 + 16` 起排（16 是布局自带的内边距）。
+                // 预留出来的那 96 点由中心平分，所以从这条墨水线往回排一定落在空地，
+                // 就算药丸被歌词/HUD 撑宽了也不会跑到边上去压别的东西。
+                let ink_left=local_cx-layout.width/2.0+16.0;
+                let ring_w=if progress.is_some() {ring_w} else {0.0};
+                let mut x=ink_left-8.0-(ring_w+base.text_w(&text,9.5,W::Regular));
+                if let Some(progress)=progress {
+                    let center=(x+ring_r,BAR_H/2.0);
+                    base.ring(center.0,center.1,ring_r,2.0,theme::DIM);
+                    let sweep=progress.clamp(0.0,1.0);
+                    if sweep>0.002 {
+                        base.arc(center.0,center.1,ring_r,-FRAC_PI_2,-FRAC_PI_2+TAU*sweep,2.0,theme::SOFT_GREEN);
                     }
+                    x+=ring_w;
                 }
-                if self.settings.task_island_speed && badge.rate>=1.0 {
-                    let rate=if badge.rate>=1000.0 {format!("{:.1}k t/s",badge.rate/1000.0)}else{format!("{:.0} t/s",badge.rate)};
-                    // 常驻内容以药丸中心居中，最左边那个槽的墨水从 `local_cx - layout.width/2 + 16` 起排
-                    // （16 是布局自带的左右内边距）：字一旦要越过这条线就只留环，
-                    // 宁可少显示一样，也别把岛上的常驻信息糊了。
-                    let limit=local_cx-layout.width/2.0+16.0-3.0;
-                    if x+base.text_w(&rate,9.5,W::Regular)<=limit {
-                        base.text(x,18.6,&rate,9.5,W::Regular,theme::GRAY,H::Left);
-                    }
+                if rate {
+                    base.text(x,18.6,&text,9.5,W::Regular,theme::GRAY,H::Left);
                 }
                 // 速度会随 token 继续涨：一秒重画一次就够，别为了角标整岛狂转。
                 base.ui.ctx().request_repaint_after(std::time::Duration::from_millis(1000));
