@@ -13,3 +13,6 @@
 *.key
 .DS_Store
 Thumbs.db
+
+# 一次性探针脚本（本轮下载器数据源调研）
+/.probe/
