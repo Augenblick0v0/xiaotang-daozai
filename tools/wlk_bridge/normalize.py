@@ -74,7 +74,7 @@ _SOFT_BREAKS = _SENTENCE_MARKS | _CLAUSE_MARKS | frozenset(" \t\n\r\u3000-—")
 # the comma pass, 48 cells = 24 CJK characters or 48 Latin characters for the
 # hard wrap.
 _CLAUSE_MAX_WIDTH = 36
-_WRAP_MAX_WIDTH = 48
+_WRAP_MAX_WIDTH = 72
 
 
 def _char_width(char: str) -> int:
@@ -221,6 +221,24 @@ def _join(left: str, right: str) -> str:
     return f"{left}{right}"
 
 
+# 这些字开头的片段通常不是新句子，而是上一句的续写。
+_CJK_CONTINUATION = set("的了着过地得而并且和与或及把被让使对从向到为就也都还又才更很其之所")
+
+
+# 流式解码在块边界偶尔会把同一个字吐两次（「欢迎迎来到」），
+# 这些叠字才是真正有意义的重复，其余相邻同字按块边界伪影折叠掉。
+_REDUPLICATED = set("看试说想谢妈爸哥姐弟妹宝星刚常渐慢悄偷好多人们天年处个件种层点些各轻静默淡久早晚大小高低长短远近新旧冷热香甜苦酸累疼亮暗深浅厚薄宽窄胖瘦红白黑蓝绿黄紫灰粉金银圆方直弯软硬干湿净脏忙闲急缓紧松满空真假对错快少")
+
+
+def _collapse_repeats(text: str) -> str:
+    out: list[str] = []
+    for ch in str(text):
+        if out and ch == out[-1] and ch not in _REDUPLICATED and "\u4e00" <= ch <= "\u9fff":
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def _split_sentences(text: str) -> tuple[list[str], str]:
     """Split a growing segment into display-sized rows.
 
@@ -255,8 +273,17 @@ def _split_sentences(text: str) -> tuple[list[str], str]:
     # 说明它是同一句的续写，先合回去再上屏。
     joined: list[str] = []
     for piece in sentences:
-        if joined and _CONTINUATION_RE.match(piece) and joined[-1][-1:] in ".!?。！？":
+        head = piece[:1]
+        if joined and head in _CJK_CONTINUATION:
+            # 中文被停顿切成「…新版本。」+「的发布计划」时，后一段以虚词开头，
+            # 是同一句的续写：去掉前段的句号直接接回去。
+            joined[-1] = f"{joined[-1].rstrip('.!?。！？')}{piece}"
+        elif joined and _CONTINUATION_RE.match(piece) and joined[-1][-1:] in ".!?。！？":
             joined[-1] = f"{joined[-1].rstrip('.!?。！？')} {piece}"
+        elif joined and joined[-1][-1:] not in ".!?。！？…" and _text_width(joined[-1]) < 60:
+            # 上行没有句末标点，说明切分点落在句子中间（「…新版本的发」+「布计划。」），
+            # 直接接回去；只有确实超宽的硬换行才保留两行。
+            joined[-1] = _join(joined[-1], piece)
         else:
             joined.append(piece)
     return joined, remainder
@@ -548,7 +575,7 @@ def to_caption_event(
                     # Positional id only: the text keeps growing while WLK
                     # re-sends the segment, so hashing it would break merging.
                     "id": f"{base_id}-{position:02d}",
-                    "text": _to_simplified(chunk, detected or current_lang),
+                    "text": _to_simplified(_collapse_repeats(chunk), detected or current_lang),
                     "translation": translation if position == len(chunks) - 1 else "",
                     "lang": detected or current_lang,
                     "start": round(chunk_start, 2),

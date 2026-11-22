@@ -49,7 +49,7 @@ class SplitSentencesTests(unittest.TestCase):
         self.assertGreaterEqual(len(segments), 2)
         self.assertEqual("".join(segments), text)
         for segment in segments:
-            self.assertLessEqual(len(segment), 24, segment)
+            self.assertLessEqual(len(segment), 36, segment)
 
     def test_english_still_splits_on_dot_question_and_exclamation(self):
         sentences, remainder = _split_sentences(
@@ -61,12 +61,12 @@ class SplitSentencesTests(unittest.TestCase):
         self.assertEqual(remainder, "")
 
     def test_chinese_commas_are_used_for_secondary_splits(self):
-        text = "今天天气很好，我们一起去公园散步，然后再去吃火锅"
+        text = "今天天气很好，我们一起去公园散步，然后再去吃火锅，顺便买点水果和饮料回家"
         segments = _segments(text)
-        self.assertGreaterEqual(len(segments), 3)
+        self.assertGreaterEqual(len(segments), 2)
         self.assertEqual("".join(segments), text)
         for segment in segments:
-            self.assertLessEqual(len(segment), 24, segment)
+            self.assertLessEqual(len(segment), 36, segment)
 
     def test_unfinished_tail_is_returned_as_remainder(self):
         sentences, remainder = _split_sentences("第一句。第二句")
@@ -76,8 +76,8 @@ class SplitSentencesTests(unittest.TestCase):
 
 class CaptionIdTests(unittest.TestCase):
     def test_ids_stay_stable_while_text_grows(self):
-        full = "这是一个没有标点符号的中文长句子我们用它来测试分段逻辑是否正确"
-        first = to_caption_event(_front(full[:30]), 1, False)
+        full = "这是一个没有标点符号的中文长句子我们用它来测试分段逻辑是否正确以及每一段的长度是否都在限制范围之内并且编号保持不变"
+        first = to_caption_event(_front(full[:40]), 1, False)
         second = to_caption_event(_front(full), 2, False)
         first_ids = [line["id"] for line in first["lines"]]
         second_ids = [line["id"] for line in second["lines"]]
@@ -130,5 +130,13 @@ class TranslationDecisionTests(unittest.TestCase):
         )
 
 
+class CjkContinuationTest(unittest.TestCase):
+    def test_stray_full_stop_before_a_particle_is_glued_back(self):
+        rows, rest = _split_sentences("今天我们要讨论新版本。的发布计划以及下个季度的时间安排。")
+        self.assertEqual(rest, "")
+        self.assertEqual(rows, ["今天我们要讨论新版本的发布计划以及下个季度的时间安排。"])
+
+
 if __name__ == "__main__":
     unittest.main()
+

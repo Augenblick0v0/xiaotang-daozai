@@ -479,15 +479,20 @@ impl App {
             // 用户刚用滚轮往下翻过：记住位置；停在底部时继续自动跟随新句子。
             self.caption_scroll = output.state.offset.y;
             let max = (output.content_size.y - output.inner_rect.height()).max(0.0);
-            if self.caption_scroll >= max - 2.0 {
-                self.caption_follow = true;
-            } else if self.caption_scroll < max - 2.0 {
-                self.caption_follow = false;
+            self.caption_max_scroll = max;
+            if self.caption_follow {
+                // 跟随新句：把记录位置钉在底部，滚轮向上翻时才交给手动偏移。
+                self.caption_scroll = max;
+            } else {
+                self.caption_scroll = self.caption_scroll.clamp(0.0, max);
+                if self.caption_scroll >= max - 2.0 {
+                    self.caption_follow = true;
+                }
             }
         }
 
         // 正在说的那半句：浅灰，跟在列表后面，不进历史。
-        if !show_translation && self.settings.caption_show_partial && !view.partial.trim().is_empty() {
+        if self.settings.caption_show_partial && !view.partial.trim().is_empty() {
             let partial = c.fit(&view.partial, 10.5, W::Regular, 360.0);
             c.text(34.0, CAPTION_FOOTER_Y - 16.0, &partial, 10.5, W::Regular, theme::DIM, H::Left);
         }

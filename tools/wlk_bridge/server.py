@@ -55,7 +55,9 @@ def _as_bool(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-DEFAULT_ZH_CONTEXT = "以下是普通话的句子，请使用简体中文。"
+# 不再给解码器塞提示词：Whisper 会把提示词本身当成音频内容转录出来，
+# 视频里的音乐/音效尤其容易触发。简体化交给 normalize 的 OpenCC 转换。
+DEFAULT_ZH_CONTEXT = ""
 MAX_CONTEXT_CHARS = 60
 
 
@@ -88,8 +90,6 @@ def resolve_translation(
 def resolve_context(language: str, raw_context: str) -> str:
     """Pick the decoder prompt: explicit query value first, zh gets a default."""
     context = str(raw_context or "").strip()
-    if not context and _language_base(language).startswith("zh"):
-        context = DEFAULT_ZH_CONTEXT
     return context[:MAX_CONTEXT_CHARS]
 
 
@@ -99,13 +99,14 @@ def build_engine(args: argparse.Namespace):
 
     config = WhisperLiveKitConfig(
         backend="faster-whisper",
-        backend_policy="localagreement",
+        backend_policy=args.policy,
         model_size=args.model,
         model_cache_dir=args.cache_dir,
         lan="auto",
         pcm_input=True,
-        vac=False,
+        vac=True,
         vad=True,
+        min_chunk_size=args.min_chunk,
         log_level="WARNING",
     )
     return TranscriptionEngine(config=config)
@@ -519,6 +520,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--model", default="base")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--beam", type=int, default=1)
+    parser.add_argument("--min-chunk", type=float, default=1.0)
+    parser.add_argument("--policy", default="localagreement", choices=["localagreement", "1", "2"])
     parser.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR)
     parser.add_argument("--nllb-size", default="600M")
     parser.add_argument("--translation-wait", type=float, default=TRANSLATION_WAIT_SECONDS)
@@ -554,9 +557,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     log("loading ASR model ...")
-    engine = build_engine(args)
-    log("warming up ASR ...")
-    warmup_engine(engine)
+    try:
+        engine = build_engine(args)
+        log("warming up ASR ...")
+        warmup_engine(engine)
+    except Exception as exc:  # noqa: BLE001 - report, then try the always-cached base model
+        log(f"model {args.model} failed: {exc!r}")
+        if args.model != "base":
+            log("falling back to base ...")
+            args.model = "base"
+            engine = build_engine(args)
+            warmup_engine(engine)
+        else:
+            raise
     log("ASR ready")
 
     translator = TranslationWorker(args.cache_dir, nllb_size=args.nllb_size)
@@ -576,4 +589,6 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
 

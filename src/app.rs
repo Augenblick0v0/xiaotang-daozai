@@ -953,6 +953,8 @@ pub struct App {
     pub(crate) caption_clear_at: Option<std::time::Instant>,
     /// 字幕记录的滚动位置（鼠标在列表上时由滚轮驱动）。
     pub(crate) caption_scroll: f32,
+    /// 记录列表可滚动到底的最大偏移，由列表渲染时回报。
+    pub(crate) caption_max_scroll: f32,
     pub(crate) caption_follow: bool,
     pub(crate) caption_epoch: u64,
     /// 开机自动开启字幕只做一次，之后尊重用户的手动开关。
@@ -1134,6 +1136,7 @@ impl App {
         caption_notice: None,
         caption_clear_at: None,
         caption_scroll: 0.0,
+        caption_max_scroll: 0.0,
             caption_follow: true,
             caption_epoch: 0,
         caption_boot: false,
@@ -2123,8 +2126,10 @@ impl App {
                 let music_volume=self.page==0 && (Rect::from_min_max(Pos2::new(354.0,106.0),Pos2::new(380.0,130.0)).contains(cursor)
                     || self.music_volume_open && crate::pages::MUSIC_VOLUME_RECT.contains(cursor));
                 if caption_list {
-                    self.caption_follow=false;
-                    self.caption_scroll=(self.caption_scroll-scroll*48.0).max(0.0);
+                    // 滚轮单位本身就是点（一格约 50），再乘 48 会把一屏直接甩到顶。
+                    let next=(self.caption_scroll-scroll).clamp(0.0,self.caption_max_scroll);
+                    self.caption_follow=next>=self.caption_max_scroll-2.0;
+                    self.caption_scroll=next;
                     self.wheel_delta=0.0;
                     ctx.input_mut(|i|{i.raw_scroll_delta=Vec2::ZERO;i.smooth_scroll_delta=Vec2::ZERO;});
                 } else if mail_reading || mail_list || music_volume {self.wheel_delta=0.0;}
@@ -3115,15 +3120,9 @@ impl App {
             let view=self.caption.view();
             // 药丸优先显示「最近一条已译好的」：最新一句常常还在等译文，
             // 只显示原文会让「原文字语言 + 译文目标语言」这个承诺落空。
-            let full=|line:&&crate::caption::Line|{
-                let text=line.text.trim();
-                !text.is_empty()&&(text.ends_with('.')||text.ends_with('!')||text.ends_with('?')
-                    ||text.ends_with('。')||text.ends_with('！')||text.ends_with('？'))
-            };
-            let last=view.lines.iter().rev().find(|line|full(line)&&!line.translation.trim().is_empty())
-                .or_else(||view.lines.iter().rev().find(|line|full(line)))
-                .or_else(||view.lines.iter().rev().find(|line|!line.text.trim().is_empty()&&!line.translation.trim().is_empty()))
-                .or_else(||view.lines.iter().rev().find(|line|!line.text.trim().is_empty()));
+            // 岛上是「最新一句」的镜像：先跟最新原文，再补译文。
+            // 不能为了等译文停在旧句上——展开页已经到下一句，药丸还挂在上一句就是脱节。
+            let last=view.lines.iter().rev().find(|line|!line.text.trim().is_empty());
             if let Some(line)=last {
                 let caption_alpha=1.0-smoothstep(0.0,0.35,p);
                 if caption_alpha>0.003 {
