@@ -297,6 +297,7 @@ pub fn start(
     force_cpu: bool,
     beam: u8,
     translate: bool,
+    translate_only: bool,
     stage: &dyn Fn(&str),
     stop: &AtomicBool,
 ) -> Result<Sidecar, String> {
@@ -322,6 +323,10 @@ pub fn start(
         "--cache-dir".into(),
         cache.display().to_string(),
     ];
+    if translate_only {
+        // Windows 实时字幕自己负责识别，侧车只当翻译服务用。
+        args.push("--translate-only".into());
+    }
     if translate {
         // 翻译模型加载要十几秒；提前在后台预热，第一句译文不用干等。
         args.push("--preload-translation".into());

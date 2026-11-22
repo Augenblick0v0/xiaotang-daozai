@@ -2,14 +2,19 @@
 
 Run:
     python tools/wlk_bridge/server.py --port 8125 --model base --device auto
+    python tools/wlk_bridge/server.py --port 8125 --translate-only
 
 Protocol (WebSocket ``/asr``):
     client -> binary PCM frames, 16 kHz mono s16le
     server -> config, captions (<= 5 fps, only on change), translation,
               error, ready_to_stop
 
-The HTTP ``GET /health`` endpoint is served by the same port via
-``websockets.serve(..., process_request=...)``; no extra web framework.
+HTTP endpoints (same host/port, FastAPI + uvicorn):
+    GET  /health     -> readiness flags
+    POST /translate  -> one-shot NLLB translation
+
+``--translate-only`` skips WhisperLiveKit entirely (no ``TranscriptionEngine``,
+no ``AudioProcessor``, no model load) and only runs the NLLB worker.
 """
 from __future__ import annotations
 
@@ -20,11 +25,18 @@ import json
 import logging
 import os
 import sys
+import time
+import uuid
+from types import SimpleNamespace
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
+import uvicorn
 import websockets
-from websockets.asyncio.server import serve
+from fastapi import FastAPI, WebSocket
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from starlette.websockets import WebSocketDisconnect
 
 try:  # ``python server.py``
     from normalize import to_caption_event
@@ -38,6 +50,10 @@ except ImportError:  # ``python -m wlk_bridge.server``
 DEFAULT_CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache"), "daozai", "wlk", "models")
 CAPTION_MIN_INTERVAL = 0.2  # 5 frames / second at most
 TRANSLATION_WAIT_SECONDS = 120.0
+# ``POST /translate`` is a synchronous request/response call; keep it short so
+# a stalled model load surfaces as 502 instead of hanging the caller.
+TRANSLATE_HTTP_TIMEOUT = 30.0
+TRANSLATE_POLL_INTERVAL = 0.02
 
 LOG = logging.getLogger("wlk_bridge")
 
@@ -120,43 +136,92 @@ def warmup_engine(engine) -> None:
     engine.asr.transcribe(audio)
 
 
+class TranslationRejected(RuntimeError):
+    """The worker refused the job (empty/auto language or a trimmed queue)."""
+
+
+class TranslationTimeout(RuntimeError):
+    """No translation arrived before the HTTP deadline."""
+
+
+def wait_for_translation(
+    translator: Any,
+    line_id: str,
+    text: str,
+    src: str,
+    tgt: str,
+    timeout: float = TRANSLATE_HTTP_TIMEOUT,
+) -> str:
+    """Blocking submit/poll loop; call it through ``asyncio.to_thread``.
+
+    ``TranslationWorker`` is a single background thread, so polling here only
+    waits on that thread; the event loop stays free for other requests.
+    """
+    if not translator.submit(line_id, text, src, tgt):
+        detail = getattr(translator, "last_error", "") or "translation worker rejected the request"
+        raise TranslationRejected(detail)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = translator.take(line_id)
+        if value is not None:
+            return value
+        time.sleep(TRANSLATE_POLL_INTERVAL)
+    raise TranslationTimeout(f"translation timed out after {timeout:g}s")
+
+
+class _WebSocketConnection:
+    """Give Starlette's WebSocket the surface ``Bridge._handle`` expects.
+
+    ``Bridge`` was written against ``websockets``; this adapter keeps the
+    protocol code untouched while uvicorn owns the socket.
+    """
+
+    def __init__(self, websocket: WebSocket) -> None:
+        self._websocket = websocket
+        query = websocket.url.query
+        path = websocket.url.path + (f"?{query}" if query else "")
+        self.request = SimpleNamespace(path=path)
+
+    async def send(self, data: Any) -> None:
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            await self._websocket.send_bytes(bytes(data))
+        else:
+            await self._websocket.send_text(str(data))
+
+    def __aiter__(self) -> "_WebSocketConnection":
+        return self
+
+    async def __anext__(self) -> Any:
+        message = await self._websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            raise WebSocketDisconnect(message.get("code") or 1000)
+        payload = message.get("bytes")
+        if payload is not None:
+            return payload
+        return message.get("text") or ""
+
+
+class TranslateRequest(BaseModel):
+    text: str
+    src: str
+    tgt: str
+
+
 class Bridge:
-    def __init__(self, args: argparse.Namespace, device: str, engine, translator: TranslationWorker):
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        device: str,
+        engine,
+        translator: TranslationWorker,
+        translate_only: bool = False,
+    ):
         self.args = args
         self.device = device
         self.engine = engine
         self.translator = translator
+        self.translate_only = translate_only
 
-    # ------------------------------------------------------------- HTTP part
-    def process_request(self, connection, request):
-        path = request.path.split("?", 1)[0]
-        if path in ("/health", "/healthz"):
-            body = json.dumps(
-                {
-                    "status": "ok",
-                    "asr_ready": True,
-                    "device": self.device,
-                    "model": self.args.model,
-                    "translate_ready": self.translator.ready,
-                },
-                ensure_ascii=False,
-            )
-            response = connection.respond(200, body)
-            # respond() already added text/plain; replace it instead of appending
-            # a second Content-Type header.
-            del response.headers["Content-Type"]
-            response.headers["Content-Type"] = "application/json; charset=utf-8"
-            response.headers["Cache-Control"] = "no-store"
-            return response
-
-        if path == "/asr":
-            # Let websockets perform the WebSocket handshake.
-            return None
-
-        response = connection.respond(404, json.dumps({"error": "not found"}))
-        del response.headers["Content-Type"]
-        response.headers["Content-Type"] = "application/json; charset=utf-8"
-        return response
 
     # --------------------------------------------------------------- WS part
     async def handler(self, websocket) -> None:
@@ -254,7 +319,7 @@ class Bridge:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     log(f"session {session_id}: pump ended with {type(exc).__name__}: {exc}")
-        except websockets.ConnectionClosed:
+        except (websockets.ConnectionClosed, WebSocketDisconnect):
             log(f"session {session_id}: client disconnected")
         except Exception as exc:  # noqa: BLE001 - report and clean up
             LOG.exception("session %s failed", session_id)
@@ -485,35 +550,146 @@ class Bridge:
             pass
 
 
-async def serve_forever(args: argparse.Namespace, bridge: Bridge) -> None:
-    server = await serve(
-        bridge.handler,
-        args.host,
-        args.port,
-        max_size=None,
-        process_request=bridge.process_request,
-        ping_interval=20,
-        ping_timeout=20,
-    )
-    # When --port 0 is used, report the actual bound port.
-    port = args.port
-    sockets = getattr(server, "sockets", None)
-    if sockets:
-        port = sockets[0].getsockname()[1]
+def create_app(bridge: Bridge) -> FastAPI:
+    """Build the HTTP + WebSocket app (used by ``serve_forever`` and tests)."""
+    app = FastAPI(title="wlk_bridge", docs_url=None, redoc_url=None, openapi_url=None)
 
-    ready = {
-        "port": port,
-        "asr_ready": True,
-        "device": bridge.device,
-        "model": args.model,
-    }
+    @app.get("/health")
+    @app.get("/healthz")
+    async def health() -> JSONResponse:
+        if bridge.translate_only:
+            payload = {
+                "status": "ok",
+                "asr_ready": False,
+                "translate_ready": bool(bridge.translator.ready),
+                "translate_only": True,
+            }
+        else:
+            payload = {
+                "status": "ok",
+                "asr_ready": True,
+                "device": bridge.device,
+                "model": bridge.args.model,
+                "translate_ready": bool(bridge.translator.ready),
+            }
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @app.api_route("/asr", methods=["GET", "POST"])
+    async def asr_http() -> JSONResponse:
+        if bridge.translate_only:
+            return JSONResponse(
+                status_code=503,
+                content={"type": "error", "error": "translation-only mode"},
+            )
+        return JSONResponse(
+            status_code=426,
+            content={"type": "error", "error": "websocket upgrade required"},
+        )
+
+    @app.post("/translate")
+    async def translate(payload: TranslateRequest) -> JSONResponse:
+        text = payload.text or ""
+        if not text.strip():
+            return JSONResponse({"translation": ""})
+        source = _language_base(payload.src)
+        if source and source == _language_base(payload.tgt):
+            return JSONResponse({"translation": text})
+
+        # Unique id per HTTP call: the worker dedupes on (line_id, text) and
+        # trims its queue, so every request must be distinguishable.
+        line_id = f"http-{uuid.uuid4().hex}"
+        try:
+            translation = await asyncio.to_thread(
+                wait_for_translation,
+                bridge.translator,
+                line_id,
+                text,
+                payload.src,
+                payload.tgt,
+                TRANSLATE_HTTP_TIMEOUT,
+            )
+        except TranslationTimeout as exc:
+            return JSONResponse(status_code=502, content={"error": str(exc)})
+        except TranslationRejected as exc:
+            return JSONResponse(status_code=502, content={"error": str(exc)})
+        if not translation:
+            detail = (
+                getattr(bridge.translator, "last_error", "")
+                or "translation worker returned an empty result"
+            )
+            return JSONResponse(status_code=502, content={"error": detail})
+        return JSONResponse({"translation": translation})
+
+    @app.websocket("/asr")
+    async def asr_websocket(websocket: WebSocket) -> None:
+        await websocket.accept()
+        if bridge.translate_only:
+            await websocket.send_text(
+                json.dumps(
+                    {"type": "error", "error": "translation-only mode"},
+                    ensure_ascii=False,
+                )
+            )
+            await websocket.close(code=1011)
+            return
+        await bridge.handler(_WebSocketConnection(websocket))
+
+    return app
+
+
+async def serve_forever(args: argparse.Namespace, bridge: Bridge) -> None:
+    config = uvicorn.Config(
+        create_app(bridge),
+        host=args.host,
+        port=args.port,
+        log_level="warning",
+        access_log=False,
+        lifespan="off",
+    )
+    server = uvicorn.Server(config)
+    task = asyncio.create_task(server.serve(), name="wlk-uvicorn")
+    # uvicorn prints its own banner at info level; wait for the bind so the
+    # WLK_READY line carries the real port when --port 0 was requested.
+    while not getattr(server, "started", False):
+        if task.done():
+            await task
+            raise RuntimeError("uvicorn stopped before startup completed")
+        await asyncio.sleep(0.02)
+
+    port = args.port
+    for listener in getattr(server, "servers", None) or []:
+        sockets = getattr(listener, "sockets", None) or []
+        if sockets:
+            try:
+                port = sockets[0].getsockname()[1]
+            except OSError:
+                port = args.port
+            break
+
+    if bridge.translate_only:
+        ready = {
+            "port": port,
+            "asr_ready": False,
+            "translate_only": True,
+            "device": "cpu",
+            "model": "nllb",
+        }
+    else:
+        ready = {
+            "port": port,
+            "asr_ready": True,
+            "device": bridge.device,
+            "model": args.model,
+        }
     print(
         "WLK_READY " + json.dumps(ready, ensure_ascii=False, separators=(",", ":")),
         flush=True,
     )
 
-    async with server:
-        await asyncio.Future()
+    try:
+        await task
+    finally:
+        server.should_exit = True
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -533,6 +709,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="warm up NLLB in the background at startup so the first caption translates fast",
     )
+    parser.add_argument(
+        "--translate-only",
+        action="store_true",
+        help="skip WhisperLiveKit entirely (no ASR model); serve /health and POST /translate only",
+    )
     return parser.parse_args(argv)
 
 
@@ -548,6 +729,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     os.environ["HF_HOME"] = args.cache_dir
     os.environ.setdefault("HF_HUB_CACHE", os.path.join(args.cache_dir, "hub"))
     logging.basicConfig(level=logging.WARNING, format="[wlk %(levelname)s] %(message)s")
+
+    if args.translate_only:
+        # No WhisperLiveKit import, patch or model load here: this mode only
+        # serves NLLB for callers that already have their own captions.
+        log("translate-only mode: ASR disabled, NLLB only")
+        translator = TranslationWorker(args.cache_dir, nllb_size=args.nllb_size)
+        log("preloading translation model ...")
+        translator.preload()
+        bridge = Bridge(args, "cpu", None, translator, translate_only=True)
+        try:
+            asyncio.run(serve_forever(args, bridge))
+        except KeyboardInterrupt:
+            log("interrupted")
+        finally:
+            translator.close()
+        return 0
 
     configure_cuda_dlls()
     device, compute_type = pick_device(

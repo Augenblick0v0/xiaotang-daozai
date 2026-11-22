@@ -140,6 +140,7 @@ impl App {
         let translate = self.settings.caption_translate
             && !crate::caption::same_language(&lang, &target);
         let cfg = StartConfig {
+            engine: self.settings.caption_engine.min(1),
             source,
             lang: lang.clone(),
             translate,
@@ -150,7 +151,8 @@ impl App {
             beam: self.settings.caption_beam.max(1),
         };
         let changed = self.caption_cfg.as_ref().is_some_and(|old| {
-            old.source != cfg.source
+            old.engine != cfg.engine
+                || old.source != cfg.source
                 || old.lang != cfg.lang
                 || old.translate != cfg.translate
                 || old.target != cfg.target
@@ -221,26 +223,32 @@ impl App {
         let mut changed = false;
 
         // 第一行：音源 / 翻译开关 / 启停。
-        let source_labels = [("系统声音", 0u8), ("麦克风", 1u8)];
         let mut x = 15.0;
-        for (text, value) in source_labels {
-            let on = self.settings.caption_source == value;
-            let (hit, inner) = crate::paint::capsule(
-                c,
-                x,
-                36.0,
-                58.0,
-                20.0,
-                &format!("cap-source-{value}"),
-                if on { theme::CYAN.linear_multiply(0.32) } else { Color32::from_white_alpha(12) },
-                if on { theme::CYAN.linear_multiply(0.42) } else { Color32::from_white_alpha(22) },
-            );
-            inner.centered_text(x + 29.0, 46.0, text, 10.0, W::Regular, if on { theme::WHITE } else { theme::GRAY }, H::Center);
-            if hit.clicked() && !on {
-                self.settings.caption_source = value;
-                changed = true;
+        if self.settings.caption_engine == 1 {
+            // 系统实时字幕自己决定听哪个设备，这里不再摆假开关。
+            c.text(15.0, 46.0, "声音由系统「实时字幕」接管", 9.5, W::Regular, theme::DIM, H::Left);
+            x = 152.0;
+        } else {
+            let source_labels = [("系统声音", 0u8), ("麦克风", 1u8)];
+            for (text, value) in source_labels {
+                let on = self.settings.caption_source == value;
+                let (hit, inner) = crate::paint::capsule(
+                    c,
+                    x,
+                    36.0,
+                    58.0,
+                    20.0,
+                    &format!("cap-source-{value}"),
+                    if on { theme::CYAN.linear_multiply(0.32) } else { Color32::from_white_alpha(12) },
+                    if on { theme::CYAN.linear_multiply(0.42) } else { Color32::from_white_alpha(22) },
+                );
+                inner.centered_text(x + 29.0, 46.0, text, 10.0, W::Regular, if on { theme::WHITE } else { theme::GRAY }, H::Center);
+                if hit.clicked() && !on {
+                    self.settings.caption_source = value;
+                    changed = true;
+                }
+                x += 62.0;
             }
-            x += 62.0;
         }
         let translate_on = self.settings.caption_translate;
         let (hit, inner) = crate::paint::capsule(
@@ -275,31 +283,36 @@ impl App {
             changed = true;
         }
 
-        // 第二行：识别语言。固定语言比 auto 稳：auto 会把中文听成日文。
-        c.text(15.0, 76.0, "识别", 9.5, W::Regular, theme::DIM, H::Left);
-        let mut lx = 38.0;
-        let mut lang_hit = false;
-        for (code, name, chip_w) in LANGS {
-            let on = self.settings.caption_lang == code;
-            let (hit, inner) = crate::paint::capsule(
-                c,
-                lx,
-                62.0,
-                chip_w,
-                20.0,
-                &format!("cap-lang-{code}"),
-                if on { theme::CYAN.linear_multiply(0.32) } else { Color32::from_white_alpha(10) },
-                if on { theme::CYAN.linear_multiply(0.42) } else { Color32::from_white_alpha(20) },
-            );
-            inner.centered_text(lx + chip_w / 2.0, 72.0, name, 9.5, W::Regular, if on { theme::WHITE } else { theme::DIM }, H::Center);
-            if hit.clicked() && !on {
-                self.settings.caption_lang = code.to_string();
-                changed = true;
-                lang_hit = true;
+        if self.settings.caption_engine == 1 {
+            // 系统实时字幕的语言在它自己的设置里选，这里只提示，不做假开关。
+            c.text(15.0, 76.0, "语言由系统「实时字幕」设置决定", 9.5, W::Regular, theme::DIM, H::Left);
+        } else {
+            // 第二行：识别语言。固定语言比 auto 稳：auto 会把中文听成日文。
+            c.text(15.0, 76.0, "识别", 9.5, W::Regular, theme::DIM, H::Left);
+            let mut lx = 38.0;
+            let mut lang_hit = false;
+            for (code, name, chip_w) in LANGS {
+                let on = self.settings.caption_lang == code;
+                let (hit, inner) = crate::paint::capsule(
+                    c,
+                    lx,
+                    62.0,
+                    chip_w,
+                    20.0,
+                    &format!("cap-lang-{code}"),
+                    if on { theme::CYAN.linear_multiply(0.32) } else { Color32::from_white_alpha(10) },
+                    if on { theme::CYAN.linear_multiply(0.42) } else { Color32::from_white_alpha(20) },
+                );
+                inner.centered_text(lx + chip_w / 2.0, 72.0, name, 9.5, W::Regular, if on { theme::WHITE } else { theme::DIM }, H::Center);
+                if hit.clicked() && !on {
+                    self.settings.caption_lang = code.to_string();
+                    changed = true;
+                    lang_hit = true;
+                }
+                lx += chip_w + 4.0;
             }
-            lx += chip_w + 4.0;
+            let _ = lang_hit;
         }
-        let _ = lang_hit;
 
         // 导出 / 清空：记录是本机文件，导出到桌面（TXT 给复制，SRT 给剪辑）。
         let (hit, inner) = crate::paint::capsule(c, 296.0, 62.0, 50.0, 20.0, "cap-export",
@@ -600,7 +613,10 @@ impl App {
             setting_row(ui, "跟随岛启动", "岛仔启动后自动开始听（否则只记住开关状态）", &mut self.settings.caption_autostart);
             ui.separator();
             ui.label(egui::RichText::new("音源").size(11.5).color(egui::Color32::from_gray(150)));
-            settings_segmented(ui, &mut self.settings.caption_source, &[(0u8, "系统声音"), (1, "麦克风")], 86.0);
+            settings_segmented(ui, &mut self.settings.caption_engine, &[(0u8, "本机 Whisper"), (1, "系统实时字幕")], 110.0);
+        ui.add_space(6.0);
+        settings_label(ui, "声音来源（Whisper 引擎）");
+        settings_segmented(ui, &mut self.settings.caption_source, &[(0u8, "系统声音"), (1, "麦克风")], 86.0);
             ui.separator();
             ui.label(egui::RichText::new("识别语言").size(11.5).color(egui::Color32::from_gray(150)));
             let mut lang: &str = match self.settings.caption_lang.as_str() {

@@ -75,6 +75,8 @@ pub struct View {
 /// 一次启动需要的参数（从 `Settings` 拷过来，线程里不再碰 UI 状态）。
 #[derive(Clone, Debug)]
 pub struct StartConfig {
+    /// 0 = 本机 Whisper 侧车；1 = Windows 实时字幕（UI Automation）。
+    pub engine: u8,
     pub source: crate::caption_audio::CaptureSource,
     /// 识别语言：`zh` / `en` / `mixed` / `ja` / `ko`（mixed 走 auto）。
     pub lang: String,
@@ -164,7 +166,11 @@ impl Captions {
         let thread = std::thread::Builder::new()
             .name("caption".into())
             .spawn(move || {
-                run(shared, stop_thread, rx, cfg);
+                if cfg.engine == 1 {
+                    run_live(shared, stop_thread, rx, cfg);
+                } else {
+                    run(shared, stop_thread, rx, cfg);
+                }
             })
             .ok();
         self.cmd = Some(tx);
@@ -256,6 +262,7 @@ fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>, rx: mpsc::Receiver<Cmd
             cfg.force_cpu,
             cfg.beam,
             cfg.translate,
+            false,
             &stage,
             &stop,
         ) {
@@ -292,6 +299,263 @@ fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>, rx: mpsc::Receiver<Cmd
             cfg.translate = on;
             cfg.target = target;
         }
+    }
+}
+
+
+/// 系统实时字幕（Windows Live Captions）引擎。
+///
+/// 识别由系统完成，这里只做三件事：读 UIA 文本 → 按句归档 → 需要时把定稿句子
+/// 发给 translate-only 侧车翻译。翻译请求走单独线程，UIA 轮询不会被 NLLB 卡住。
+fn run_live(
+    shared: Arc<Mutex<Shared>>,
+    stop: Arc<AtomicBool>,
+    rx: mpsc::Receiver<Cmd>,
+    cfg: StartConfig,
+) {
+    let mut cfg = cfg;
+    publish(&shared, |view| {
+        view.status = Status::Starting;
+        view.stage = "正在连接系统实时字幕…".into();
+    });
+    let mut live = match crate::live_captions::LiveCaptions::start() {
+        Ok(live) => live,
+        Err(error) => {
+            publish(&shared, |view| {
+                view.status = Status::Failed;
+                view.stage = "系统实时字幕没起来".into();
+                view.error = Some(error);
+            });
+            return;
+        }
+    };
+
+    // 翻译服务：translate-only 侧车。翻译模型加载慢，先起在后台，字幕照常出。
+    let mut sidecar: Option<crate::caption_runtime::Sidecar> = None;
+    let mut jobs: Option<mpsc::Sender<(String, String, String)>> = None;
+    let mut worker: Option<std::thread::JoinHandle<()>> = None;
+    if cfg.translate {
+        let stage = |text: &str| {
+            publish(&shared, |view| {
+                if view.status == Status::Starting {
+                    view.stage = text.to_string();
+                }
+            });
+        };
+        match crate::caption_runtime::start(
+            &cfg.python,
+            &cfg.model,
+            cfg.force_cpu,
+            cfg.beam,
+            true,
+            true,
+            &stage,
+            &stop,
+        ) {
+            Ok(sc) => {
+                let url = format!("http://127.0.0.1:{}/translate", sc.port);
+                let target = cfg.target.clone();
+                let (tx, queue) = mpsc::channel::<(String, String, String)>();
+                let tr_shared = shared.clone();
+                worker = Some(std::thread::spawn(move || {
+                    while let Ok((id, text, src)) = queue.recv() {
+                        let body = serde_json::json!({
+                            "text": text,
+                            "src": src,
+                            "tgt": target,
+                        })
+                        .to_string();
+                        // 侧车刚起步时 NLLB 还在加载，POST 会 502；等模型热起来再试，
+                        // 否则第一句永远没有译文。
+                        let mut translated = None;
+                        for attempt in 0..8 {
+                            translated = ureq::post(&url)
+                                .timeout(Duration::from_secs(120))
+                                .set("Content-Type", "application/json")
+                                .send_string(&body)
+                                .ok()
+                                .and_then(|response| response.into_string().ok())
+                                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                                .and_then(|value| {
+                                    value.get("translation").and_then(|v| v.as_str()).map(str::to_string)
+                                });
+                            if translated.is_some() {
+                                break;
+                            }
+                            if attempt < 7 {
+                                std::thread::sleep(Duration::from_secs(3));
+                            }
+                        }
+                        if let Some(text) = translated {
+                            publish(&tr_shared, |view| {
+                                if let Some(line) =
+                                    view.history.iter_mut().rev().find(|line| line.id == id)
+                                {
+                                    line.translation = text;
+                                }
+                            });
+                        }
+                    }
+                }));
+                jobs = Some(tx);
+                sidecar = Some(sc);
+            }
+            Err(error) => {
+                publish(&shared, |view| {
+                    view.error = Some(format!("翻译不可用：{error}"));
+                });
+            }
+        }
+    }
+
+    publish(&shared, |view| {
+        view.status = Status::Running;
+        view.stage.clear();
+        view.error = None;
+        view.device = "系统".into();
+        view.model = "实时字幕".into();
+        view.translate = cfg.translate;
+    });
+
+    let mut last_text = String::new();
+    // 还在增长的那半句只有一条：快照每来一次就更新它，不能每来一次就多一行。
+    let mut open_id: Option<String> = None;
+    let mut open_seq = 0usize;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                Cmd::Stop => {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                Cmd::Translate(on, target) => {
+                    cfg.translate = on;
+                    cfg.target = target;
+                }
+            }
+        }
+        let mut changed = false;
+        while let Some(event) = live.try_recv() {
+            match event {
+                crate::live_captions::LiveEvent::Text(text) => {
+                    if text == last_text {
+                        continue;
+                    }
+                    last_text = text.clone();
+                    let sentences = crate::live_captions::split_sentences(&text);
+                    let count = sentences.len();
+                    for (position, sentence) in sentences.into_iter().enumerate() {
+                        let last = position + 1 == count;
+                        let id = if last && !sentence.final_ {
+                            if open_id.is_none() {
+                                open_seq += 1;
+                                open_id = Some(format!("live-part-{open_seq}"));
+                            }
+                            open_id.clone().unwrap_or_default()
+                        } else if last && sentence.final_ {
+                            open_id.take().unwrap_or_else(|| format!("live-{:08x}", fnv1a(&sentence.text)))
+                        } else {
+                            format!("live-{:08x}", fnv1a(&sentence.text))
+                        };
+                        let lang = detect_lang(&sentence.text).to_string();
+                        publish(&shared, |view| {
+                            if let Some(line) =
+                                view.history.iter_mut().rev().find(|line| line.id == id)
+                            {
+                                line.text = sentence.text.clone();
+                                line.done = sentence.final_;
+                                line.lang = lang.clone();
+                            } else {
+                                view.history.push(Line {
+                                    id: id.clone(),
+                                    text: sentence.text.clone(),
+                                    lang: lang.clone(),
+                                    done: sentence.final_,
+                                    ..Default::default()
+                                });
+                            }
+                            view.lines =
+                                view.history.iter().rev().take(6).rev().cloned().collect();
+                            view.lang = lang.clone();
+                            view.lang_prob = 1.0;
+                            view.last_at = Some(Instant::now());
+                            view.partial = if sentence.final_ {
+                                String::new()
+                            } else {
+                                sentence.text.clone()
+                            };
+                        });
+                        if sentence.final_ {
+                            if let Some(jobs) = &jobs {
+                                if cfg.translate && !same_language(&lang, &cfg.target) {
+                                    let _ = jobs.send((id, sentence.text.clone(), lang));
+                                }
+                            }
+                        }
+                    }
+                    changed = true;
+                }
+                crate::live_captions::LiveEvent::Ready => {
+                    publish(&shared, |view| {
+                        view.status = Status::Running;
+                        view.stage.clear();
+                        view.lang = detect_lang(&last_text).to_string();
+                    });
+                }
+                crate::live_captions::LiveEvent::Error(error) => {
+                    publish(&shared, |view| {
+                        view.error = Some(error.clone());
+                        view.stage = format!("系统实时字幕：{error}");
+                    });
+                }
+            }
+        }
+        let _ = changed;
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    live.stop();
+    drop(jobs);
+    if let Some(worker) = worker {
+        let _ = worker.join();
+    }
+    drop(sidecar);
+}
+
+/// 稳定 id：同一句在不同快照里得到同一个 hash，历史里就不会重复。
+fn fnv1a(text: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// 系统实时字幕不报语言；按字符集做最小判断，够岛上显示 `[ZH]` / `[EN]` 用。
+fn detect_lang(text: &str) -> &'static str {
+    let mut han = 0usize;
+    let mut kana = 0usize;
+    let mut hangul = 0usize;
+    let mut latin = 0usize;
+    for ch in text.chars() {
+        match ch as u32 {
+            0x3040..=0x30ff => kana += 1,
+            0xac00..=0xd7af => hangul += 1,
+            0x4e00..=0x9fff => han += 1,
+            _ if ch.is_ascii_alphabetic() => latin += 1,
+            _ => {}
+        }
+    }
+    if kana > 0 {
+        "ja"
+    } else if hangul > 0 {
+        "ko"
+    } else if han > latin {
+        "zh"
+    } else {
+        "en"
     }
 }
 
@@ -808,6 +1072,7 @@ mod tests {
             sample_line("b", "上一场的第二句。", ""),
         ]);
         captions.start(StartConfig {
+            engine: 0,
             source: crate::caption_audio::CaptureSource::SystemLoopback,
             lang: "zh".into(),
             translate: false,

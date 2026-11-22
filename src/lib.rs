@@ -75,6 +75,7 @@ pub mod caption;
 pub mod caption_runtime;
 pub mod caption_history;
 pub mod caption_ui;
+pub mod live_captions;
 pub mod theme;
 pub mod settings_theme;
 mod updates;

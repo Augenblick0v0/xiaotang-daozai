@@ -991,7 +991,11 @@ impl App {
                 done: true,
             })
             .collect();
-        let caption_saved = caption_seed.len();
+        // 已经在盘上的句子算作「保存过」，否则首帧会把整份历史再写一遍，文件越长重复越多。
+        let caption_saved_seed: std::collections::HashMap<String, String> = caption_seed
+            .iter()
+            .map(|line| (line.id.clone(), line.translation.clone()))
+            .collect();
         let (bw, bh) = if settings.minimal { (BAR_W_MIN, BAR_H_MIN) } else { (BAR_W, BAR_H) };
         let focus_seconds=settings.focus_minutes as f32*60.0;
         let initial_lyrics=settings.lyrics_enabled;
@@ -1131,7 +1135,7 @@ impl App {
         caption_cfg: None,
         caption_install: crate::caption_ui::Installer::new(),
         caption_history,
-        caption_saved: std::collections::HashMap::new(),
+        caption_saved: caption_saved_seed,
         caption_notice: None,
         caption_clear_at: None,
         caption_scroll: 0.0,
@@ -1831,10 +1835,7 @@ impl App {
         let view=self.caption.view();
         let visible=self.settings.caption_on_island
             && !self.open
-            && matches!(view.status,crate::caption::Status::Running|crate::caption::Status::Starting)
-            // 用 history 而不是 lines：lines 只在收到本场字幕帧后才有内容，重连或刚开一秒时为空，
-            // 岛上就什么都不显示（用户看到的就是「开了识别但岛上没有」）。
-            && view.history.last().is_some_and(|line|!line.text.trim().is_empty());
+            && matches!(view.status,crate::caption::Status::Running|crate::caption::Status::Starting);
         if let Ok(path)=std::env::var("DAOZAI_CAPTION_DEBUG") {
             use std::sync::atomic::{AtomicU64,Ordering};
             static LAST:AtomicU64=AtomicU64::new(0);
@@ -3146,7 +3147,10 @@ impl App {
             // 只显示原文会让「原文字语言 + 译文目标语言」这个承诺落空。
             // 岛上是「最新一句」的镜像：先跟最新原文，再补译文。
             // 不能为了等译文停在旧句上——展开页已经到下一句，药丸还挂在上一句就是脱节。
-            let last=view.history.iter().rev().find(|line|!line.text.trim().is_empty());
+            // 只看本场新内容：上一场留下的旧句不该在刚开启时冒充「正在识别」。
+            let last=view.history.iter().skip(view.session_start).rev().find(|line|!line.text.trim().is_empty());
+            let placeholder=crate::caption::Line{text:"正在听…".into(),..Default::default()};
+            let last=last.or(Some(&placeholder));
             if let Some(line)=last {
                 let caption_alpha=1.0-smoothstep(0.0,0.35,p);
                 if caption_alpha>0.003 {
@@ -3169,37 +3173,58 @@ impl App {
                     // 吉祥物坐在药丸左侧（PET 中心距左沿 60），字幕从它右边起排，别糊在脸上。
                     if self.pet_enabled() {x=x.max(left+90.0);}
                     let avail=(right-x).max(0.0);
-                    let original=line.text.trim();
+                    let latest=line.text.trim();
+                    let previous=view.history.iter().skip(view.session_start).rev()
+                        .filter(|row|!row.text.trim().is_empty())
+                        .nth(1)
+                        .map(|row|row.text.trim().to_string());
                     let translation=line.translation.trim();
                     let partial=view.partial.trim();
-                    let ink=if line.done {theme::WHITE}else{theme::GRAY};
-                    // 开了翻译：上行原文、下行译文。没开翻译但还在说：下行放正在增长的半句，
-                    // 这样两行都能用上，不会白白空一行。
-                    let second:Option<(&str,egui::Color32)>=if view.translate {
-                        if !translation.is_empty() {
-                            Some((translation,theme::CYAN))
-                        } else {
-                            // 译文没出来之前别把下一句的半句塞进来——那会顶掉上一句的译文。
-                            Some(("翻译中…",theme::DIM))
+                    // 断句优先：超过可用宽度时退到最近的句末/逗号，别从词中间切。
+                    let fit_sentence=|text:&str,size:f32,weight:W,max:f32|->String{
+                        if c.text_w(text,size,weight)<=max{return text.to_string();}
+                        let mut best=None;
+                        for (index,ch) in text.char_indices(){
+                            let width=c.text_w(&text[..index+ch.len_utf8()],size,weight);
+                            if width>max{break;}
+                            if "。！？!?，,；;、 ".contains(ch){best=Some(index+ch.len_utf8());}
                         }
-                    } else if !partial.is_empty()&&partial!=original {
-                        Some((partial,theme::GRAY))
+                        match best {Some(cut)=>format!("{}…",&text[..cut]),None=>c.fit(text,size,weight,max)}
+                    };
+                    // 没开翻译：上行上一句、下行最新一句，两行都是识别结果。
+                    let (top_text,top_done)=if view.translate {
+                        (latest.to_string(),line.done)
+                    } else if let Some(previous)=previous.as_deref() {
+                        (previous.to_string(),true)
+                    } else {
+                        (latest.to_string(),line.done)
+                    };
+                    let bottom:Option<(String,egui::Color32)>=if view.translate {
+                        if !translation.is_empty(){
+                            Some((translation.to_string(),theme::CYAN))
+                        }else{
+                            Some(("翻译中…".to_string(),theme::DIM))
+                        }
+                    } else if previous.is_some(){
+                        Some((latest.to_string(),if line.done{theme::WHITE}else{theme::GRAY}))
+                    } else if !partial.is_empty()&&partial!=latest {
+                        Some((partial.to_string(),theme::GRAY))
                     } else {
                         None
                     };
-                    match second {
+                    let ink=if top_done {theme::WHITE}else{theme::GRAY};
+                    match bottom {
                         Some((sub,tint)) => {
-                            // 句子长的时候先缩字号，缩到 9pt 还放不下才截断，尽量让整句都能看见。
-                            let first_size=if c.text_w(original,12.0,W::Semibold)<=avail {12.0}
-                                else if c.text_w(original,10.5,W::Semibold)<=avail {10.5} else {9.0};
-                            let first=c.fit(original,first_size,W::Semibold,avail);
+                            let first_size=if c.text_w(&top_text,12.0,W::Semibold)<=avail {12.0}
+                                else if c.text_w(&top_text,10.5,W::Semibold)<=avail {10.5} else {9.0};
+                            let first=fit_sentence(&top_text,first_size,W::Semibold,avail);
                             c.text(x,21.0,&first,first_size,W::Semibold,ink,H::Left);
-                            let sub_size=if c.text_w(sub,10.5,W::Regular)<=avail {10.5} else {9.0};
-                            let sub=c.fit(sub,sub_size,W::Regular,avail);
+                            let sub_size=if c.text_w(&sub,10.5,W::Regular)<=avail {10.5} else {9.0};
+                            let sub=fit_sentence(&sub,sub_size,W::Regular,avail);
                             c.text(x,39.0,&sub,sub_size,W::Regular,tint,H::Left);
                         }
                         None => {
-                            let text=c.fit(original,12.0,W::Semibold,avail);
+                            let text=fit_sentence(&top_text,12.0,W::Semibold,avail);
                             c.text(x,center_y+4.5,&text,12.0,W::Semibold,ink,H::Left);
                         }
                     }
