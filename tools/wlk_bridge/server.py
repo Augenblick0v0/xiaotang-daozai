@@ -35,7 +35,7 @@ except ImportError:  # ``python -m wlk_bridge.server``
     from .translate_worker import TranslationWorker
     from .wlk_loader import configure_cuda_dlls, install_faster_whisper_patch, pick_device
 
-DEFAULT_CACHE_DIR = r"D:\_research\wlk-cache"
+DEFAULT_CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache"), "daozai", "wlk", "models")
 CAPTION_MIN_INTERVAL = 0.2  # 5 frames / second at most
 TRANSLATION_WAIT_SECONDS = 120.0
 
@@ -532,3 +532,4 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

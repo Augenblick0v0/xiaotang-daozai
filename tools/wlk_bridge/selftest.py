@@ -36,7 +36,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--model", default="base")
     parser.add_argument("--beam", type=int, default=1)
-    parser.add_argument("--cache-dir", default=r"D:\_research\wlk-cache")
+    parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--nllb-size", default="600M")
     parser.add_argument("--timeout", type=float, default=90.0, help="translation wait seconds")
     parser.add_argument("--python", default=sys.executable, help="python used for the server")
@@ -278,3 +278,4 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
