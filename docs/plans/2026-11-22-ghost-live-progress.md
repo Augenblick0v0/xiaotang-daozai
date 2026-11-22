@@ -111,3 +111,4 @@ Ghost Downloader 的下载任务，在岛仔的「下载」页与上岛卡片上
 - 落地：`download_sources` 默认 `[false,false,true]`；`download_tick` 构造扫描配置时强制 `[false,false,<Ghost 开关>]`，
   IDM/FDM 即使旧配置里开着也不碰（不读注册表、不开 sqlite）；设置页只留 Ghost Downloader 一个来源开关；
   页面空态、设置说明、设置分组描述与页面描述都改成 Ghost 专用文案。
+- 2026-11-22 09:40 只适配 Ghost 的 release：24,291,328 字节，sha256 `2280A498FE02F6E8279E70BC412A227C6129EDED957E10F26510050B21B788E6`，已用桌面快捷方式启动（pid 26112），并实测到 `127.0.0.1:14370` 的 WebSocket 连接。
