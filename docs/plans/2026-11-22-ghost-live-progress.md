@@ -104,3 +104,10 @@ Ghost Downloader 的下载任务，在岛仔的「下载」页与上岛卡片上
 - 桌面快捷方式「岛仔－当前测试版」目标 = 上述 exe，工作目录 `D:\Daozai_fork`；已用该快捷方式启动，进程 pid 45408、路径核对一致。
 - 全量 lib 测试：1351 passed / 0 failed / 143 ignored（`cargo test --locked --lib --features record -- --test-threads=1`）。
 - 备注：首次出包失败是因为旧实例（pid 43244）锁着 release exe（`failed to remove file …daozai.exe`）；先停进程再构建即通过。
+
+## 9. 范围变更（2026-11-22 09:24）
+
+- 用户决定：**IDM 不适配，只适配 Ghost Downloader**。
+- 落地：`download_sources` 默认 `[false,false,true]`；`download_tick` 构造扫描配置时强制 `[false,false,<Ghost 开关>]`，
+  IDM/FDM 即使旧配置里开着也不碰（不读注册表、不开 sqlite）；设置页只留 Ghost Downloader 一个来源开关；
+  页面空态、设置说明、设置分组描述与页面描述都改成 Ghost 专用文案。

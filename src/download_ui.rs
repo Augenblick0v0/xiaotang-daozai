@@ -1,6 +1,6 @@
-//! 「下载」页：把 IDM / Free Download Manager / Ghost Downloader 最近的下载任务搬上岛。
+//! 「下载」页：把 Ghost Downloader 最近的下载任务搬上岛（只适配 Ghost）。
 //!
-//! 数据全部来自这三个客户端自己写在磁盘上的记录（`download_scan` 只读文件，不联网、
+//! 任务清单来自 Ghost 自己写的 `tasks.jsonl`，进度与速度走它的本地 WebSocket（`download_scan` 只读，不联网、
 //! 不去它们的窗口里点任何东西），所以「读不到」是常态：客户端没装、或者从没下载过
 //! 东西，这里就少一行，而不是编一行出来。
 use crate::app::*;
@@ -60,7 +60,7 @@ impl DownloadNotice {
             .filter(|other| other.id != item.id && other.is_active())
             .count();
         // 在跑却一个字节都没记到（实测 Ghost 下载中就是这样）：不画百分比，
-        // 0% 不是进度，是谎。有真实增量时（IDM/FDM、或 Ghost 完成时）照常给。
+        // 0% 不是进度，是谎。拿到真实增量时照常给；没有就画不确定条。
         let percent = if item.total > 0 && !(item.is_active() && item.done == 0) {
             Some(item.percent())
         } else {
@@ -72,7 +72,7 @@ impl DownloadNotice {
                 detail.push_str(" · ");
                 detail.push_str(&item.speed_text());
             } else if !item.live {
-                // 客户端自己没在写速度（FDM 库内就没有速度字段、IDM 退出后只剩残留值）：
+                // 拿不到实时速度时（通道没连上、或只读到 jsonl 存量）：
                 // 明说是上次落盘的数字，别让人以为卡住了。
                 detail.push_str(" · 上次记录");
             }
@@ -118,7 +118,7 @@ fn state_rank(state: DlState) -> u8 {
 /// 一条都没在跑时，只报「刚刚收场」的那条几秒，之后安静。
 pub(crate) fn pick_island_download<'a>(items: &'a [DownloadItem], now_ms: i64) -> Option<&'a DownloadItem> {
     let mut best: Option<&DownloadItem> = None;
-    // 只报真正在写盘的。Paused/Queued 可能是几个月前的残留（IDM 44 条 Status=0 就是），
+    // 只报真正在写盘的。Paused/Queued 可能是几个月前的残留，
     // 让它们占岛会把通知和常驻入口全顶掉。
     for item in items.iter().filter(|item| item.state == DlState::Downloading) {
         best = Some(match best {
@@ -172,7 +172,8 @@ impl App {
             return;
         }
         let cfg = ScanConfig {
-            sources: self.settings.download_sources,
+            // 只适配 Ghost：IDM/FDM 即使旧配置里是开的也不碰（不读注册表、不开 sqlite）。
+            sources: [false, false, self.settings.download_sources[2]],
             keep_minutes: self.settings.download_keep_minutes,
             now_ms: crate::download_scan::now_ms(),
         };
@@ -287,16 +288,16 @@ impl App {
         let width = c.text_w("最近", size::TITLE, W::Bold);
         c.text(15.0 + width + 1.5, 25.0, "下载", size::TITLE, W::Bold, theme::CYAN, H::Left);
         if items.is_empty() {
-            let all_off = !self.settings.download_sources.iter().any(|enabled| *enabled);
+            let all_off = !self.settings.download_sources[2];
             let (title, hint) = if all_off {
                 (
-                    "三个下载来源都关掉了",
-                    "到 设置 → 下载 里把要看的客户端打开，这里才会去读它们的下载记录",
+                    "Ghost Downloader 还关着",
+                    "到 设置 → 下载 里把它打开，这里才会去读它的下载记录",
                 )
             } else {
                 (
                     "没有最近的下载",
-                    "IDM、Free Download Manager、Ghost Downloader 下过东西以后，这里会列出来；没装或从没下载过就一直是空的",
+                    "Ghost Downloader 下过东西以后，这里会列出来；没装或从没下载过就一直是空的",
                 )
             };
             c.text(34.0, 70.0, title, 13.0, W::Bold, theme::WHITE, H::Left);
@@ -422,22 +423,8 @@ impl App {
         settings_card(ui, |ui| {
             setting_row(
                 ui,
-                "IDM",
-                "读取 Internet Download Manager 的下载清单",
-                &mut self.settings.download_sources[0],
-            );
-            ui.separator();
-            setting_row(
-                ui,
-                "Free Download Manager",
-                "读取 FDM 的本地任务数据库",
-                &mut self.settings.download_sources[1],
-            );
-            ui.separator();
-            setting_row(
-                ui,
                 "Ghost Downloader",
-                "读取 GhostDownloader 的任务记录",
+                "读取任务的进度、速度与完成时间",
                 &mut self.settings.download_sources[2],
             );
         });
@@ -480,7 +467,7 @@ impl App {
         settings_card(ui, |ui| {
             ui.label(
                 egui::RichText::new(
-                    "岛仔只读这三个客户端自己写在磁盘上的下载记录，不联网、不上传，\
+                    "岛仔只读 Ghost Downloader 自己写在磁盘上的记录，不联网、不上传，\
                      也不去它们的界面里点任何东西。\
                      「删除」只是把文件送进回收站，记录本身不动；文件已经被移走的行会标成读不到。",
                 )

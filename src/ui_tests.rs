@@ -9390,7 +9390,7 @@ fn download_page_renders_and_maps_to_its_settings_tab(){
     let _=h.ctx.run(egui::RawInput::default(),|ctx|h.app.settings_ui(ctx,false));
     let shapes=output.lock().unwrap().take().unwrap().shapes;
     let texts:Vec<String>=shapes.iter().filter_map(|s|match &s.shape{egui::Shape::Text(t)=>Some(t.galley.text().to_string()),_=>None}).collect();
-    for want in ["下载","下载来源","IDM","Free Download Manager","Ghost Downloader","有下载时上岛","上岛显示速度","删除前确认"]{
+    for want in ["下载","下载来源","Ghost Downloader","有下载时上岛","上岛显示速度","删除前确认"]{
         assert!(texts.iter().any(|t|t==want),"设置分页 16 里应有「{want}」");
     }
 }
