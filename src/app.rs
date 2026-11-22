@@ -44,7 +44,7 @@ pub const CAPTION_PAGE: usize = 11;
 pub(crate) const WEATHER_H: f32 = 232.0;
 pub(crate) const TASK_H: f32 = 232.0;
 pub(crate) const DOWNLOAD_H: f32 = 232.0;
-pub(crate) const CAPTION_H: f32 = 232.0;
+pub(crate) const CAPTION_H: f32 = 260.0;
 pub(crate) const CALENDAR_H: f32 = 216.0;
 pub const BAR_W: f32 = 163.0; // 收起药丸宽
 pub const BAR_H: f32 = 30.0; // 收起药丸高
@@ -52,6 +52,9 @@ pub(crate) const HUD_W: f32 = 260.0;
 pub(crate) const LYRIC_BAR_W: f32 = 300.0;
 /// 收起药丸上的字幕条宽度：比歌词条宽，容得下原文 + 译文一行。
 pub(crate) const CAPTION_BAR_W: f32 = 440.0;
+/// 字幕条用两行：上面原文、下面译文（或正在增长的那半句）。
+/// 单行时再长也只能塞进一行省略号，读不到后半句——这是用户明确点名的毛病。
+pub(crate) const CAPTION_BAR_H: f32 = 52.0;
 pub(crate) const HUD_TRACK_X: f32 = 48.0;
 pub(crate) const HUD_TRACK_W: f32 = 150.0;
 pub const BAR_W_MIN: f32 = 44.0; // 极简小条
@@ -940,6 +943,18 @@ pub struct App {
     pub(crate) caption_cfg: Option<crate::caption::StartConfig>,
     /// 「安装识别环境」的后台进度。
     pub(crate) caption_install: crate::caption_ui::Installer,
+    /// 落盘的字幕记录（跨重启，按上限自动裁剪）。
+    pub(crate) caption_history: crate::caption_history::History,
+    /// 已经并进 `caption_history` 的条数，用来增量追加。
+    pub(crate) caption_saved: usize,
+    /// 页面上的导出/清空结果提示（文本 + 出现时刻）。
+    pub(crate) caption_notice: Option<(String, std::time::Instant)>,
+    /// 清空按钮的第一下（5 秒内再点才真清），防误触。
+    pub(crate) caption_clear_at: Option<std::time::Instant>,
+    /// 字幕记录的滚动位置（鼠标在列表上时由滚轮驱动）。
+    pub(crate) caption_scroll: f32,
+    pub(crate) caption_follow: bool,
+    pub(crate) caption_epoch: u64,
     /// 开机自动开启字幕只做一次，之后尊重用户的手动开关。
     caption_boot: bool,
 }
@@ -957,10 +972,23 @@ impl App {
         });
         let settings = model::Settings::load();
         let clipboard_on = settings.clipboard_history;
+        let caption_history = crate::caption_history::History::load(
+            model::config_dir().join("caption-history.jsonl"),
+            (settings.caption_history_mb as usize).max(1) * 1024 * 1024,
+        );
+        // 每次启动都从空白一屏开始；上一场的记录已经存在磁盘里，仍可导出。
+        let caption_saved = 0usize;
         let (bw, bh) = if settings.minimal { (BAR_W_MIN, BAR_H_MIN) } else { (BAR_W, BAR_H) };
         let focus_seconds=settings.focus_minutes as f32*60.0;
         let initial_lyrics=settings.lyrics_enabled;
         let initial_page=settings.page_order.iter().copied().find(|page|settings.visible_pages[*page]).unwrap_or(0);
+        // 调试构建专用：不碰鼠标也能把某个页面渲染出来做视觉验收。release 里不会编译这两行。
+        #[cfg(debug_assertions)]
+        let initial_page = std::env::var("DAOZAI_START_PAGE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|page| *page < PAGE_NAMES.len())
+            .unwrap_or(initial_page);
         let weather_source=crate::weather_source_ui::State::load();
         let mut weather=crate::weather::State::load(&settings.weather_city,settings.weather_position.as_ref());
         if weather_source.displayed==crate::weather_source_ui::Provider::Qweather {weather.snapshot=weather_source.runtime.snapshot();}
@@ -973,7 +1001,7 @@ impl App {
             shelf: model::Shelf::load(),
             w: Spring::new(bw, CLOSE.0, CLOSE.1),
             h: Spring::new(bh, CLOSE.0, CLOSE.1),
-            open: false,
+            open: cfg!(debug_assertions) && std::env::var("DAOZAI_START_OPEN").is_ok(),
             hover_since: None,
             leave_since: None,
             hover_lock: false,
@@ -1081,9 +1109,18 @@ impl App {
         download: crate::download_scan::Watcher::new(),
         download_confirm: None,
         download_dismissed: None,
-        caption: crate::caption::Captions::new(),
+        caption: {
+            crate::caption::Captions::new()
+        },
         caption_cfg: None,
         caption_install: crate::caption_ui::Installer::new(),
+        caption_history,
+        caption_saved,
+        caption_notice: None,
+        caption_clear_at: None,
+        caption_scroll: 0.0,
+            caption_follow: true,
+            caption_epoch: 0,
         caption_boot: false,
         }
     }
@@ -1768,6 +1805,8 @@ impl App {
 
     fn island_lyrics_active(&self)->bool {
         if self.side() {return false;}
+        // 实时字幕在跑时优先显示字幕：同一条药丸只能放一个，识别比歌词更该被看见。
+        if self.island_caption_active() {return false;}
         self.settings.island_lyrics && self.settings.visible_pages[0] && self.media.is_music() && self.media.playing
             && !self.browser_minimal_active
     }
@@ -1883,8 +1922,11 @@ impl App {
             // 左右停靠：竖向胶囊（通知仍是贴边滑出的横向卡片，见上）。
             return self.side_base_size(self.effective_minimal()&&self.t>=self.notification_bell_until);
         }
-        if self.island_ticker_active() {
-            (self.island_ticker_width(),BAR_H)
+        if self.island_lyrics_active() {
+            (self.lyric_bar_width(),BAR_H)
+        } else if self.island_caption_active() {
+            // 字幕要两行（原文上、译文下），药丸跟着长高，不然第二行画到窗外。
+            (self.caption_bar_width(),CAPTION_BAR_H)
         } else if self.effective_minimal()&&self.t>=self.notification_bell_until {
             (BAR_W_MIN, BAR_H_MIN)
         } else {
@@ -2060,9 +2102,17 @@ impl App {
                 let cursor=env.cursor.unwrap()-self.content_origin(win).to_vec2();
                 let mail_reading=inside && self.page==5 && self.mail.open_uid.is_some();
                 let mail_list=self.page==5 && !self.mail.accounts.is_empty() && self.mail.open_uid.is_none() && self.mail_list_bounds().contains(cursor);
+                // 字幕页：鼠标在记录列表上时滚轮只滚列表，别把整页翻走。
+                let caption_list=self.page==CAPTION_PAGE
+                    && Rect::from_min_max(Pos2::new(15.0,88.0),Pos2::new(404.0,238.0)).contains(cursor);
                 let music_volume=self.page==0 && (Rect::from_min_max(Pos2::new(354.0,106.0),Pos2::new(380.0,130.0)).contains(cursor)
                     || self.music_volume_open && crate::pages::MUSIC_VOLUME_RECT.contains(cursor));
-                if mail_reading || mail_list || music_volume {self.wheel_delta=0.0;}
+                if caption_list {
+                    self.caption_follow=false;
+                    self.caption_scroll=(self.caption_scroll-scroll*48.0).max(0.0);
+                    self.wheel_delta=0.0;
+                    ctx.input_mut(|i|{i.raw_scroll_delta=Vec2::ZERO;i.smooth_scroll_delta=Vec2::ZERO;});
+                } else if mail_reading || mail_list || music_volume {self.wheel_delta=0.0;}
                 else {
                     // 累积高精度滚轮的小幅输入；停顿或反向时丢弃上一段余量。
                     if self.t-self.wheel_at>0.18 || self.wheel_delta*scroll<0.0 {self.wheel_delta=0.0;}
@@ -3044,13 +3094,20 @@ impl App {
         if lyric_alpha>=0.997 {return;}
         let header=base.faded(1.0-lyric_alpha);
         let base=&header;
-        // 实时字幕条：没有歌词时占用药丸，替代时钟区。只画最近一行；
-        // 最后一行还在增长（done=false）也照样显示，用灰色区别于定稿句。
+        // 实时字幕条：没有歌词时占用药丸，替代时钟区。两行——上行原文、下行译文；
+        // 单行时再长也只能看前半句，所以药丸在这时会长高（见 base_size / CAPTION_BAR_H）。
         if !self.island_lyrics_active() && self.island_caption_active() {
             let view=self.caption.view();
             // 药丸优先显示「最近一条已译好的」：最新一句常常还在等译文，
             // 只显示原文会让「原文字语言 + 译文目标语言」这个承诺落空。
-            let last=view.lines.iter().rev().find(|line|!line.text.trim().is_empty()&&!line.translation.trim().is_empty())
+            let full=|line:&&crate::caption::Line|{
+                let text=line.text.trim();
+                !text.is_empty()&&(text.ends_with('.')||text.ends_with('!')||text.ends_with('?')
+                    ||text.ends_with('。')||text.ends_with('！')||text.ends_with('？'))
+            };
+            let last=view.lines.iter().rev().find(|line|full(line)&&!line.translation.trim().is_empty())
+                .or_else(||view.lines.iter().rev().find(|line|full(line)))
+                .or_else(||view.lines.iter().rev().find(|line|!line.text.trim().is_empty()&&!line.translation.trim().is_empty()))
                 .or_else(||view.lines.iter().rev().find(|line|!line.text.trim().is_empty()));
             if let Some(line)=last {
                 let caption_alpha=1.0-smoothstep(0.0,0.35,p);
@@ -3059,8 +3116,7 @@ impl App {
                     let content_width=self.caption_bar_width()-self.lyric_focus_space();
                     let width=self.w.pos.max(content_width);
                     let left=local_cx-width/2.0;
-                    let center_y=BAR_H/2.0;
-                    let base_y=center_y+4.5;
+                    let center_y=CAPTION_BAR_H/2.0;
                     let right=left+content_width-12.0;
                     let mut x=left+12.0;
                     let tag=if view.lang.trim().is_empty(){String::new()}else{crate::caption_ui::language_tag(&view.lang)};
@@ -3070,27 +3126,40 @@ impl App {
                         c.circle(x+3.0,center_y,2.2,theme::CYAN);
                         x+=12.0;
                     } else {
-                        x+=c.text(x,base_y,&tag,10.0,W::Semibold,theme::CYAN,H::Left)+7.0;
+                        x+=c.text(x,center_y+3.5,&tag,10.0,W::Semibold,theme::CYAN,H::Left)+7.0;
                     }
                     // 吉祥物坐在药丸左侧（PET 中心距左沿 60），字幕从它右边起排，别糊在脸上。
                     if self.pet_enabled() {x=x.max(left+90.0);}
-                    let fsize=12.0;
-                    let ink=if line.done {theme::WHITE}else{theme::GRAY};
                     let avail=(right-x).max(0.0);
                     let original=line.text.trim();
-                    if line.translation.trim().is_empty() {
-                        let text=c.fit(original,fsize,W::Semibold,avail);
-                        c.text(x,base_y,&text,fsize,W::Semibold,ink,H::Left);
+                    let translation=line.translation.trim();
+                    let partial=view.partial.trim();
+                    let ink=if line.done {theme::WHITE}else{theme::GRAY};
+                    // 开了翻译：上行原文、下行译文。没开翻译但还在说：下行放正在增长的半句，
+                    // 这样两行都能用上，不会白白空一行。
+                    let second:Option<(&str,egui::Color32)>=if view.translate {
+                        if !translation.is_empty() {
+                            Some((translation,theme::CYAN))
+                        } else {
+                            // 译文没出来之前别把下一句的半句塞进来——那会顶掉上一句的译文。
+                            Some(("翻译中…",theme::DIM))
+                        }
+                    } else if !partial.is_empty()&&partial!=original {
+                        Some((partial,theme::GRAY))
                     } else {
-                        // 译文最多占 45%：空间不够时原文和译文都做省略号截断。
-                        let sep="  ·  ";
-                        let sep_w=c.text_w(sep,fsize,W::Regular);
-                        let trans=c.fit(line.translation.trim(),fsize,W::Regular,(avail*0.45).max(0.0));
-                        let trans_w=c.text_w(&trans,fsize,W::Regular);
-                        let text=c.fit(original,fsize,W::Semibold,(avail-sep_w-trans_w).max(0.0));
-                        x+=c.text(x,base_y,&text,fsize,W::Semibold,ink,H::Left);
-                        x+=c.text(x,base_y,sep,fsize,W::Regular,theme::DIM,H::Left);
-                        c.text(x,base_y,&trans,fsize,W::Regular,theme::CYAN,H::Left);
+                        None
+                    };
+                    match second {
+                        Some((sub,tint)) => {
+                            let first=c.fit(original,12.0,W::Semibold,avail);
+                            c.text(x,21.0,&first,12.0,W::Semibold,ink,H::Left);
+                            let sub=c.fit(sub,10.5,W::Regular,avail);
+                            c.text(x,39.0,&sub,10.5,W::Regular,tint,H::Left);
+                        }
+                        None => {
+                            let text=c.fit(original,12.0,W::Semibold,avail);
+                            c.text(x,center_y+4.5,&text,12.0,W::Semibold,ink,H::Left);
+                        }
                     }
                     if self.pomo.running {
                         let alpha=smoothstep(0.88,1.0,(width-content_width)/self.lyric_focus_space());

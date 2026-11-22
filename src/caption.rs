@@ -50,6 +50,9 @@ pub struct View {
     pub lang: String,
     pub lang_prob: f32,
     pub lines: Vec<Line>,
+    /// 本次会话的完整记录：按 id 合并全部字幕（面板只摊最近几行，
+    /// 记录页/导出要的是全量）。侧车每次发的是快照，不能直接替换历史。
+    pub history: Vec<Line>,
     /// 还没定稿的那半句（侧车的 buffer_transcription）。
     pub partial: String,
     pub error: Option<String>,
@@ -66,6 +69,8 @@ pub struct View {
 #[derive(Clone, Debug)]
 pub struct StartConfig {
     pub source: crate::caption_audio::CaptureSource,
+    /// 识别语言：`zh` / `en` / `mixed` / `ja` / `ko`（mixed 走 auto）。
+    pub lang: String,
     pub translate: bool,
     pub target: String,
     pub python: String,
@@ -175,6 +180,26 @@ impl Captions {
         });
     }
 
+    /// 开机时把上次留下的记录灌进视图，页面一打开就能看见旧句子。
+    /// 只在还没有任何实时结果时生效，避免把正在跑的会话覆盖掉。
+    pub fn seed_history(&mut self, lines: Vec<Line>) {
+        self.set(|view| {
+            if view.history.is_empty() && !lines.is_empty() {
+                view.lines = lines.iter().rev().take(6).rev().cloned().collect();
+                view.history = lines;
+            }
+        });
+    }
+
+    /// 清空本次会话的记录（不动已落盘的历史，那份由页面自己的 History 管）。
+    pub fn clear_history(&mut self) {
+        self.set(|view| {
+            view.history.clear();
+            view.lines.clear();
+            view.partial.clear();
+        });
+    }
+
     /// 热切换翻译：不断连接，只换目标语言（侧车按 query 里带的 target 走，
     /// 所以真要换语言还是得重连——这里用「记下来 + 由调用方 restart」的策略）。
     pub fn set_translation(&mut self, on: bool, target: &str) {
@@ -271,9 +296,15 @@ fn session(
 ) -> SessionEnd {
     let mut ws_cfg = tungstenite::protocol::WebSocketConfig::default();
     ws_cfg.max_message_size = Some(4 << 20);
+    // 「中英混合」就是逐段自动判定；显式固定一种语言能少很多误判。
+    let language = match cfg.lang.trim() {
+        "" | "mixed" => "auto",
+        other => other,
+    };
     let url = format!(
-        "ws://127.0.0.1:{}/asr?language=auto&translate={}&target_language={}",
+        "ws://127.0.0.1:{}/asr?language={}&translate={}&target_language={}",
         sidecar.port,
+        urlencoding(language),
         if cfg.translate { 1 } else { 0 },
         urlencoding(&cfg.target)
     );
@@ -447,7 +478,37 @@ fn apply(shared: &Arc<Mutex<Shared>>, text: &str) {
                 view.lang = lang;
                 view.lang_prob = lang_prob;
                 view.partial = partial;
-                view.lines = lines;
+                // 侧车给的是「当前缓冲区的快照」：整段话会被反复重发，
+                // 直接覆盖会让记录只剩最后几行。按 id 并进历史，
+                // 同一句增长时原地更新，新句才追加。
+                for line in lines {
+                    if line.text.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(existing) = view.history.iter_mut().find(|old| old.id == line.id) {
+                        existing.text = line.text;
+                        if !line.translation.trim().is_empty() {
+                            existing.translation = line.translation;
+                        }
+                        existing.lang = line.lang;
+                        existing.done = line.done;
+                        existing.end = existing.end.max(line.end);
+                    } else {
+                        view.history.push(line);
+                    }
+                }
+                if view.history.len() > 2000 {
+                    let drop = view.history.len() - 2000;
+                    view.history.drain(0..drop);
+                }
+                view.lines = view
+                    .history
+                    .iter()
+                    .rev()
+                    .take(6)
+                    .rev()
+                    .cloned()
+                    .collect();
                 view.last_at = Some(Instant::now());
             });
         }
@@ -459,6 +520,9 @@ fn apply(shared: &Arc<Mutex<Shared>>, text: &str) {
             }
             publish(shared, |view| {
                 if let Some(line) = view.lines.iter_mut().find(|line| line.id == id) {
+                    line.translation = translation.clone();
+                }
+                if let Some(line) = view.history.iter_mut().find(|line| line.id == id) {
                     line.translation = translation;
                 }
                 view.last_at = Some(Instant::now());
@@ -504,6 +568,21 @@ fn urlencoding(value: &str) -> String {
         }
     }
     out
+}
+
+/// 源语言与目标语言是不是同一种（`zh-Hans` 与 `zh` 算同一种）。
+/// 同语言时翻译没有意义，NLLB 还会把中文「翻」成另一句中文，必须跳过。
+pub fn same_language(source: &str, target: &str) -> bool {
+    let base = |code: &str| -> String {
+        let lower = code.trim().to_ascii_lowercase();
+        lower.split(['-', '_', '>']).next().unwrap_or("").to_string()
+    };
+    let src = base(source);
+    // mixed = auto，识别器逐段判定，不能预判同语。
+    if src.is_empty() || src == "auto" || src == "mixed" || target.trim().is_empty() {
+        return false;
+    }
+    src == base(target)
 }
 
 /// 语言码 → 岛上显示的名字。
@@ -600,6 +679,21 @@ mod tests {
     }
 
     #[test]
+    fn stopping_keeps_the_transcript_on_screen() {
+        let mut captions = Captions::new();
+        apply(
+            &captions.shared,
+            r#"{"type":"captions","seq":1,"status":"active","lang":"en","lang_prob":0.9,
+                "lines":[{"id":"s1","text":"hello","translation":"","lang":"en","start":0.0,"end":1.0,"final":true}]}"#,
+        );
+        captions.stop();
+        let view = captions.view();
+        assert_eq!(view.status, Status::Off);
+        assert_eq!(view.history.len(), 1, "停止之后记录要留在屏幕上");
+        assert_eq!(view.history[0].text, "hello");
+    }
+
+    #[test]
     fn garbage_does_not_panic_or_change_state() {
         let captions = Captions::new();
         apply(&captions.shared, "not json");
@@ -607,3 +701,4 @@ mod tests {
         assert_eq!(captions.view().status, Status::Off);
     }
 }
+

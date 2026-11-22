@@ -16,11 +16,21 @@ use std::sync::{Arc, Mutex};
 /// 页面上最多显示几行（旧的往上顶掉）。
 const ROWS: usize = 3;
 /// 译文行的浅色。
-const CAPTION_FOOTER_Y: f32 = 214.0;
+const CAPTION_FOOTER_Y: f32 = 246.0;
 /// 译文行的浅色。
 const TRANSLATION: Color32 = Color32::from_rgb(150, 214, 226);
 
 /// 可选的目标语言：短码 + 岛上显示名。只放常用的，不做两百语言的菜单。
+/// 识别语言：短码 + 页面显示名 + 胶囊宽度。`mixed` 交给 auto 逐段判定，
+/// 但默认不选它——固定中文能明显减少「听成日文/英文」。
+const LANGS: [(&str, &str, f32); 5] = [
+    ("zh", "中文", 40.0),
+    ("en", "English", 44.0),
+    ("mixed", "中英", 38.0),
+    ("ja", "日本語", 44.0),
+    ("ko", "한국어", 46.0),
+];
+
 const TARGETS: [(&str, &str); 4] = [("zh", "中文"), ("en", "English"), ("ja", "日本語"), ("ko", "한국어")];
 
 /// 安装运行环境的进度（后台线程写，页面每帧读）。
@@ -99,7 +109,17 @@ impl Installer {
 
 impl App {
     /// 每帧对齐「设置里想不想开」和「实际在不在跑」。
+    fn epoch_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
     pub(crate) fn caption_tick(&mut self) {
+        // 设置里改了上限就立刻生效（改小会顺手裁掉最旧的）。
+        let cap = (self.settings.caption_history_mb as usize).max(1) * 1024 * 1024;
+        self.caption_history.set_cap_bytes(cap);
         let wanted = self.settings.caption_enabled;
         if !wanted {
             if self.caption.active() {
@@ -114,9 +134,15 @@ impl App {
             CaptureSource::SystemLoopback
         };
         let target = self.settings.caption_target_lang.clone();
+        let lang = self.settings.caption_lang.clone();
+        // 源语言和目标语言相同时翻译没有意义（NLLB 会给出另一句中文），
+        // 这里只关掉这次会话的翻译，别改用户的开关。
+        let translate = self.settings.caption_translate
+            && !crate::caption::same_language(&lang, &target);
         let cfg = StartConfig {
             source,
-            translate: self.settings.caption_translate,
+            lang: lang.clone(),
+            translate,
             target: target.clone(),
             python: self.settings.caption_python.clone(),
             model: self.settings.caption_model.clone(),
@@ -125,6 +151,7 @@ impl App {
         };
         let changed = self.caption_cfg.as_ref().is_some_and(|old| {
             old.source != cfg.source
+                || old.lang != cfg.lang
                 || old.translate != cfg.translate
                 || old.target != cfg.target
                 || old.python != cfg.python
@@ -133,17 +160,38 @@ impl App {
                 || old.beam != cfg.beam
         });
         if !self.caption.active() {
+            self.caption_epoch = Self::epoch_secs();
             self.caption.start(cfg.clone());
             self.caption_cfg = Some(cfg.clone());
         } else if changed {
             self.caption.stop();
+            self.caption_epoch = Self::epoch_secs();
             self.caption.start(cfg.clone());
             self.caption_cfg = Some(cfg.clone());
         }
         // 安装完成后自动接着启动（用户刚装完不该再点一次）。
         if !self.caption.active() && self.caption_install.view().finished {
+            self.caption_epoch = Self::epoch_secs();
             self.caption.start(cfg.clone());
             self.caption_cfg = Some(cfg.clone());
+        }
+        // 把新定稿的字幕并进落盘记录（按 id 去重；攒够一批再写，别每帧刷盘）。
+        let view = self.caption.view();
+        if view.history.len() > self.caption_saved {
+            for line in view.history.iter().skip(self.caption_saved) {
+                self.caption_history.record(crate::caption_history::Entry {
+                    id: format!("{}-{}", self.caption_epoch, line.id),
+                    text: line.text.clone(),
+                    translation: line.translation.clone(),
+                    lang: line.lang.clone(),
+                    start: line.start,
+                    end: line.end,
+                });
+            }
+            self.caption_saved = view.history.len();
+            let _ = self.caption_history.flush();
+        } else if view.history.len() < self.caption_saved {
+            self.caption_saved = view.history.len();
         }
     }
 
@@ -162,12 +210,12 @@ impl App {
             Status::Failed => (theme::RED, "出错"),
             Status::Off => (theme::DIM, "已停止"),
         };
-        // 状态灯收在标题右侧：右上角是设置齿轮，别压上去；原文语种在页脚显示。
         c.circle(296.0, 22.0, 3.0, tint);
         c.text(304.0, 25.0, label, 10.0, W::Semibold, tint, H::Left);
 
-        // 控制条：音源 / 翻译 / 启停。
         let mut changed = false;
+
+        // 第一行：音源 / 翻译开关 / 启停。
         let source_labels = [("系统声音", 0u8), ("麦克风", 1u8)];
         let mut x = 15.0;
         for (text, value) in source_labels {
@@ -189,7 +237,6 @@ impl App {
             }
             x += 62.0;
         }
-        // 翻译开关：只占一个短胶囊，目标语言放到第二行选，避免一行挤六个胶囊。
         let translate_on = self.settings.caption_translate;
         let (hit, inner) = crate::paint::capsule(
             c,
@@ -201,43 +248,11 @@ impl App {
             if translate_on { theme::GREEN.linear_multiply(0.35) } else { Color32::from_white_alpha(12) },
             if translate_on { theme::GREEN.linear_multiply(0.45) } else { Color32::from_white_alpha(22) },
         );
-        inner.centered_text(
-            x + 24.0,
-            46.0,
-            if translate_on { "译文" } else { "原文" },
-            10.0,
-            W::Regular,
-            if translate_on { theme::WHITE } else { theme::GRAY },
-            H::Center,
-        );
+        inner.centered_text(x + 24.0, 46.0, if translate_on { "译文" } else { "原文" }, 10.0, W::Regular, if translate_on { theme::WHITE } else { theme::GRAY }, H::Center);
         if hit.clicked() {
             self.settings.caption_translate = !translate_on;
             changed = true;
         }
-        if self.settings.caption_translate {
-            c.text(15.0, 73.0, "译成", 9.5, W::Regular, theme::DIM, H::Left);
-            let mut tx = 42.0;
-            for (code, name) in TARGETS {
-                let on = self.settings.caption_target_lang == code;
-                let (hit, inner) = crate::paint::capsule(
-                    c,
-                    tx,
-                    60.0,
-                    60.0,
-                    20.0,
-                    &format!("cap-target-{code}"),
-                    if on { theme::CYAN.linear_multiply(0.3) } else { Color32::from_white_alpha(10) },
-                    if on { theme::CYAN.linear_multiply(0.42) } else { Color32::from_white_alpha(20) },
-                );
-                inner.centered_text(tx + 30.0, 70.0, name, 9.5, W::Regular, if on { theme::WHITE } else { theme::DIM }, H::Center);
-                if hit.clicked() && !on {
-                    self.settings.caption_target_lang = code.to_string();
-                    changed = true;
-                }
-                tx += 64.0;
-            }
-        }
-        // 启停按钮贴在右边。
         let running = self.settings.caption_enabled;
         let (hit, inner) = crate::paint::capsule(
             c,
@@ -255,25 +270,100 @@ impl App {
             changed = true;
         }
 
-        // 中间：字幕本体。
-        let top = if self.settings.caption_translate { 88.0 } else { 64.0 };
-        let rows = if self.settings.caption_translate { 2 } else { ROWS };
+        // 第二行：识别语言。固定语言比 auto 稳：auto 会把中文听成日文。
+        c.text(15.0, 76.0, "识别", 9.5, W::Regular, theme::DIM, H::Left);
+        let mut lx = 38.0;
+        let mut lang_hit = false;
+        for (code, name, chip_w) in LANGS {
+            let on = self.settings.caption_lang == code;
+            let (hit, inner) = crate::paint::capsule(
+                c,
+                lx,
+                62.0,
+                chip_w,
+                20.0,
+                &format!("cap-lang-{code}"),
+                if on { theme::CYAN.linear_multiply(0.32) } else { Color32::from_white_alpha(10) },
+                if on { theme::CYAN.linear_multiply(0.42) } else { Color32::from_white_alpha(20) },
+            );
+            inner.centered_text(lx + chip_w / 2.0, 72.0, name, 9.5, W::Regular, if on { theme::WHITE } else { theme::DIM }, H::Center);
+            if hit.clicked() && !on {
+                self.settings.caption_lang = code.to_string();
+                changed = true;
+                lang_hit = true;
+            }
+            lx += chip_w + 4.0;
+        }
+        let _ = lang_hit;
+
+        // 导出 / 清空：记录是本机文件，导出到桌面（TXT 给复制，SRT 给剪辑）。
+        let (hit, inner) = crate::paint::capsule(c, 296.0, 62.0, 50.0, 20.0, "cap-export",
+            Color32::from_white_alpha(12), Color32::from_white_alpha(24));
+        inner.centered_text(321.0, 72.0, "导出", 9.5, W::Regular, theme::GRAY, H::Center);
+        if hit.clicked() {
+            let message = self.caption_export(&view);
+            self.caption_notice = Some((message, std::time::Instant::now()));
+        }
+        let clear_armed = self.caption_clear_at.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(5));
+        let (hit, inner) = crate::paint::capsule(c, 350.0, 62.0, 50.0, 20.0, "cap-clear",
+            if clear_armed { theme::RED.linear_multiply(0.4) } else { Color32::from_white_alpha(12) },
+            Color32::from_white_alpha(24));
+        inner.centered_text(375.0, 72.0, if clear_armed { "确认" } else { "清空" }, 9.5, W::Regular, if clear_armed { theme::WHITE } else { theme::GRAY }, H::Center);
+        if hit.clicked() {
+            if clear_armed {
+                self.caption.clear_history();
+                self.caption_history.clear();
+                let _ = self.caption_history.save();
+                self.caption_clear_at = None;
+                self.caption_notice = Some(("已清空本次记录".to_string(), std::time::Instant::now()));
+            } else {
+                self.caption_clear_at = Some(std::time::Instant::now());
+            }
+        }
+
+        // 第三行：译文目标语言（只在开了翻译时出现）。
+        let mut list_top = 90.0;
+        if self.settings.caption_translate {
+            c.text(15.0, 104.0, "译成", 9.5, W::Regular, theme::DIM, H::Left);
+            let mut tx = 42.0;
+            for (code, name) in TARGETS {
+                let on = self.settings.caption_target_lang == code;
+                let (hit, inner) = crate::paint::capsule(
+                    c,
+                    tx,
+                    88.0,
+                    60.0,
+                    20.0,
+                    &format!("cap-target-{code}"),
+                    if on { theme::CYAN.linear_multiply(0.3) } else { Color32::from_white_alpha(10) },
+                    if on { theme::CYAN.linear_multiply(0.42) } else { Color32::from_white_alpha(20) },
+                );
+                inner.centered_text(tx + 30.0, 98.0, name, 9.5, W::Regular, if on { theme::WHITE } else { theme::DIM }, H::Center);
+                if hit.clicked() && !on {
+                    self.settings.caption_target_lang = code.to_string();
+                    changed = true;
+                }
+                tx += 64.0;
+            }
+            list_top = 114.0;
+        }
+
         if view.status == Status::Off && !self.settings.caption_enabled {
-            // 没开：说明能干什么，别摆一个空框。
-            c.text(15.0, top + 26.0, "把正在放的声音变成字幕", 12.5, W::Semibold, theme::WHITE, H::Left);
+            let top = list_top;
+            c.text(15.0, top + 18.0, "把正在放的声音变成字幕", 12.5, W::Semibold, theme::WHITE, H::Left);
             let hint = c.fit(
                 "点右上角「开启」：岛上会实时显示原文和它是什么语言；打开翻译还能同时显示译文。声音只在本机处理，不上传。",
                 10.5,
                 W::Regular,
                 380.0,
             );
-            c.text(15.0, top + 44.0, &hint, 10.5, W::Regular, theme::GRAY, H::Left);
-            c.text(15.0, top + 78.0, "需要先装一次识别环境（约 2.5 GB，只装一次）", 10.0, W::Regular, theme::DIM, H::Left);
+            c.text(15.0, top + 36.0, &hint, 10.5, W::Regular, theme::GRAY, H::Left);
+            c.text(15.0, top + 66.0, "需要先装一次识别环境（约 2.5 GB，只装一次）", 10.0, W::Regular, theme::DIM, H::Left);
             let ready = crate::caption_runtime::installed();
             let (hit, inner) = crate::paint::capsule(
                 c,
                 15.0,
-                top + 90.0,
+                top + 78.0,
                 if ready { 88.0 } else { 132.0 },
                 22.0,
                 "cap-install",
@@ -287,98 +377,143 @@ impl App {
             } else {
                 "安装识别环境".to_string()
             };
-            inner.centered_text(
-                15.0 + if ready { 44.0 } else { 66.0 },
-                top + 101.0,
-                &label,
-                10.5,
-                W::Semibold,
-                theme::WHITE,
-                H::Center,
-            );
+            inner.centered_text(15.0 + if ready { 44.0 } else { 66.0 }, top + 89.0, &label, 10.5, W::Semibold, theme::WHITE, H::Center);
             if hit.clicked() && !ready && !install.running {
                 self.caption_install.start();
             }
             if !install.stage.is_empty() {
                 let stage = c.fit(&install.stage, 9.5, W::Regular, 380.0);
-                c.text(15.0, top + 122.0, &stage, 9.5, W::Regular, theme::DIM, H::Left);
+                c.text(15.0, top + 110.0, &stage, 9.5, W::Regular, theme::DIM, H::Left);
             }
             if let Some(error) = &install.error {
                 let text = c.fit(error, 9.5, W::Regular, 380.0);
-                c.text(15.0, top + 136.0, &text, 9.5, W::Regular, theme::RED, H::Left);
+                c.text(15.0, top + 124.0, &text, 9.5, W::Regular, theme::RED, H::Left);
             }
             self.caption_footer(c, &view);
             return;
         }
 
-        // 有内容：把最近几行摊开（新的在下面）。
-        let shown: Vec<&Line> = view
-            .lines
-            .iter()
-            .filter(|line| !line.text.trim().is_empty())
-            .rev()
-            .take(rows)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        let mut y = top + 4.0;
-        if shown.is_empty() {
+        // 记录区：可滚动，滚到底跟随最新一句。侧车每帧发的是快照，
+        // 历史在 caption.rs 里按 id 合并过，这里画的是全量。
+        let list_h = (CAPTION_FOOTER_Y - 22.0 - list_top).max(40.0);
+        let list_rect = c.rect(12.0, list_top, 396.0, list_h);
+        let mut content = egui::Ui::new(
+            c.ui.ctx().clone(),
+            egui::Id::new(("caption-history", c.live)),
+            egui::UiBuilder::new()
+                .max_rect(list_rect)
+                .layer_id(c.painter.layer_id())
+                .style(c.ui.style().clone()),
+        );
+        content.set_clip_rect(list_rect.intersect(c.painter.clip_rect()));
+        content.set_opacity(c.painter.opacity());
+        content.spacing_mut().item_spacing.y = 0.0;
+        content.spacing_mut().scroll.floating = false;
+        content.spacing_mut().scroll.bar_width = 4.0 * c.s;
+
+        let show_translation = self.settings.caption_translate;
+        let row_h = if show_translation { 34.0 } else { 19.0 };
+        let history = &view.history;
+        if history.is_empty() {
             let waiting = match view.status {
                 Status::Starting => view.stage.clone(),
                 Status::Failed => view.error.clone().unwrap_or_else(|| "识别引擎出错了".into()),
-                _ => {
-                    if view.partial.trim().is_empty() {
-                        "在听…（说话就会出字）".to_string()
-                    } else {
-                        String::new()
-                    }
-                }
+                _ => "在听…（说话就会出字）".to_string(),
             };
             if !waiting.is_empty() {
                 let waiting = c.fit(&waiting, 11.0, W::Regular, 380.0);
-                c.text(15.0, top + 30.0, &waiting, 11.0, W::Regular, if view.status == Status::Failed { theme::RED } else { theme::DIM }, H::Left);
+                c.text(15.0, list_top + 24.0, &waiting, 11.0, W::Regular, if view.status == Status::Failed { theme::RED } else { theme::DIM }, H::Left);
             }
-        }
-        for line in shown {
-            let tag = if line.lang.is_empty() { language_tag(&view.lang) } else { language_tag(&line.lang) };
-            let original = if line.text.trim().is_empty() { line.translation.clone() } else { line.text.clone() };
-            let text = c.fit(&original, 12.0, W::Regular, 352.0);
-            c.text(15.0, y + 11.0, &tag, 9.0, W::Semibold, theme::CYAN, H::Left);
-            c.text(38.0, y + 11.0, &text, 12.0, W::Regular, theme::WHITE, H::Left);
-            y += 17.0;
-            if self.settings.caption_translate {
-                let translated = if line.translation.trim().is_empty() {
-                    if line.done {
-                        "翻译中…".to_string()
-                    } else {
-                        String::new()
+        } else {
+            let offset = if self.caption_follow { f32::MAX / 2.0 } else { self.caption_scroll };
+            let output = egui::ScrollArea::vertical()
+                .id_salt("caption-history-scroll")
+                .auto_shrink([false, false])
+                .vertical_scroll_offset(offset)
+                .show_rows(&mut content, row_h * c.s, history.len(), |ui, range| {
+                    for index in range {
+                        let line = &history[index];
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(392.0 * c.s, row_h * c.s), egui::Sense::hover());
+                        let mut row = Card::new(ui, rect.min, ui.clip_rect());
+                        row.s = c.s;
+                        row.live = c.live;
+                        let tag = if line.lang.is_empty() { language_tag(&view.lang) } else { language_tag(&line.lang) };
+                        row.text(0.0, 11.0, &tag, 9.0, W::Semibold, theme::CYAN, H::Left);
+                        let original = if line.text.trim().is_empty() { line.translation.clone() } else { line.text.clone() };
+                        let text = row.fit(&original, 12.0, W::Regular, 356.0);
+                        row.text(22.0, 11.0, &text, 12.0, W::Regular, if line.done { theme::WHITE } else { theme::GRAY }, H::Left);
+                        if show_translation {
+                            let translated = if line.translation.trim().is_empty() {
+                                if line.done { "翻译中…".to_string() } else { String::new() }
+                            } else {
+                                line.translation.clone()
+                            };
+                            if !translated.is_empty() {
+                                let dialog = row.fit(&translated, 10.5, W::Regular, 356.0);
+                                row.text(22.0, 27.0, &dialog, 10.5, W::Regular, TRANSLATION, H::Left);
+                            }
+                        }
                     }
-                } else {
-                    line.translation.clone()
-                };
-                if !translated.is_empty() && y + 10.0 < CAPTION_FOOTER_Y - 8.0 {
-                    let dialog = c.fit(&translated, 11.0, W::Regular, 352.0);
-                    c.text(38.0, y + 10.0, &dialog, 11.0, W::Regular, TRANSLATION, H::Left);
-                    y += 15.0;
-                }
-            }
-            y += 6.0;
-        }
-        // 正在说的那半句：浅灰、只占最后一行，不参与历史。
-        if !self.settings.caption_translate && self.settings.caption_show_partial && !view.partial.trim().is_empty() {
-            let partial = c.fit(&view.partial, 11.0, W::Regular, 352.0);
-            if y < 200.0 {
-                c.text(38.0, y + 10.0, &partial, 11.0, W::Regular, theme::DIM, H::Left);
+                });
+            // 用户刚用滚轮往下翻过：记住位置；停在底部时继续自动跟随新句子。
+            self.caption_scroll = output.state.offset.y;
+            let max = (output.content_size.y - output.inner_rect.height()).max(0.0);
+            if self.caption_scroll >= max - 2.0 {
+                self.caption_follow = true;
+            } else if self.caption_scroll < max - 2.0 {
+                self.caption_follow = false;
             }
         }
+
+        // 正在说的那半句：浅灰，跟在列表后面，不进历史。
+        if !show_translation && self.settings.caption_show_partial && !view.partial.trim().is_empty() {
+            let partial = c.fit(&view.partial, 10.5, W::Regular, 360.0);
+            c.text(34.0, CAPTION_FOOTER_Y - 16.0, &partial, 10.5, W::Regular, theme::DIM, H::Left);
+        }
+
+        // 导出/清空的结果提示，显示 6 秒。
+        if let Some((message, at)) = &self.caption_notice {
+            if at.elapsed() < std::time::Duration::from_secs(6) {
+                let text = c.fit(message, 9.5, W::Regular, 300.0);
+                c.text(15.0, CAPTION_FOOTER_Y - 2.0, &text, 9.5, W::Regular, theme::SOFT_GREEN, H::Left);
+            }
+        }
+
         self.caption_footer(c, &view);
 
-        // 字幕是流式的：在跑就按 200 ms 催重绘，别等鼠标动。
         if view.status == Status::Running {
             c.ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
         }
         let _ = changed;
+    }
+
+    /// 把这次（含以前几次）的记录导出成桌面上的 TXT + SRT。
+    /// 返回给页面显示的短提示；失败也照实说，不静默。
+    fn caption_export(&mut self, view: &crate::caption::View) -> String {
+        let dir = std::env::var_os("USERPROFILE")
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join("Desktop"))
+            .filter(|desktop| desktop.is_dir())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let txt = dir.join(format!("字幕记录-{stamp}.txt"));
+        let srt = dir.join(format!("字幕记录-{stamp}.srt"));
+        // 记录可能刚从内存并入还没落盘；导出前先刷一次，保证两边一致。
+        let _ = self.caption_history.flush();
+        let mut result = if self.caption_history.is_empty() {
+            // 极端情况：记录模块还没收到任何条目，但视图里已有内容。
+            let _ = view;
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "还没有可导出的记录"))
+        } else {
+            Ok(())
+        };
+        if result.is_ok() {
+            result = self.caption_history.export_txt(&txt).and_then(|_| self.caption_history.export_srt(&srt));
+        }
+        match result {
+            Ok(()) => format!("已导出到桌面（{} 句）", self.caption_history.len()),
+            Err(error) => format!("导出失败：{error}"),
+        }
     }
 
     fn caption_footer(&self, c: &Card, view: &crate::caption::View) {
@@ -389,7 +524,7 @@ impl App {
         if view.translate && !view.target.is_empty() {
             parts.push(format!("译文 {}", language_name(&view.target)));
         }
-        parts.push(format!("{} 句", view.lines.len()));
+        parts.push(format!("{} 句", view.history.len()));
         let text = parts.join(" · ");
         c.text(15.0, CAPTION_FOOTER_Y, &text, 9.5, W::Regular, theme::DIM, H::Left);
         // 右侧小字：设备/模型，出错时换成错误原文的头部。
@@ -440,6 +575,23 @@ impl App {
             ui.label(egui::RichText::new("音源").size(11.5).color(egui::Color32::from_gray(150)));
             settings_segmented(ui, &mut self.settings.caption_source, &[(0u8, "系统声音"), (1, "麦克风")], 86.0);
             ui.separator();
+            ui.label(egui::RichText::new("识别语言").size(11.5).color(egui::Color32::from_gray(150)));
+            let mut lang: &str = match self.settings.caption_lang.as_str() {
+                "en" => "en",
+                "mixed" => "mixed",
+                "ja" => "ja",
+                "ko" => "ko",
+                _ => "zh",
+            };
+            if settings_segmented(ui, &mut lang, &[("zh", "中文"), ("en", "English"), ("mixed", "中英"), ("ja", "日本語"), ("ko", "한국어")], 62.0) {
+                self.settings.caption_lang = lang.to_string();
+            }
+            ui.label(
+                egui::RichText::new("固定一种语言比「自动」准得多；中文会要求模型输出简体。")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(140)),
+            );
+            ui.separator();
             setting_row(ui, "显示未定稿的半句", "把还在识别中的那半句用浅色显示出来", &mut self.settings.caption_show_partial);
             ui.separator();
             setting_row(ui, "收起时在岛上显示", "岛收起成药丸时，在角标位置滚动显示最近一句", &mut self.settings.caption_on_island);
@@ -458,6 +610,19 @@ impl App {
             if settings_segmented(ui, &mut code, &[("zh", "中文"), ("en", "English"), ("ja", "日本語"), ("ko", "한국어")], 74.0) {
                 self.settings.caption_target_lang = code.to_string();
             }
+        });
+        settings_label(ui, "记录");
+        settings_card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("最多保存");
+                ui.add(egui::DragValue::new(&mut self.settings.caption_history_mb).range(1..=500).speed(1.0));
+                ui.label("MB 的字幕记录");
+            });
+            ui.label(
+                egui::RichText::new("每次识别的原文和译文都会存下来，超过上限自动删最旧的；字幕页可以随时导出 TXT/SRT。")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(140)),
+            );
         });
         settings_label(ui, "识别引擎");
         settings_card(ui, |ui| {

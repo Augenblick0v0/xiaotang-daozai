@@ -55,6 +55,44 @@ def _as_bool(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+DEFAULT_ZH_CONTEXT = "以下是普通话的句子，请使用简体中文。"
+MAX_CONTEXT_CHARS = 60
+
+
+def _language_base(code: str) -> str:
+    """Return the primary language subtag: ``zh-CN`` / ``zh_TW`` -> ``zh``."""
+    text = str(code or "").strip().lower().replace("_", "-")
+    if not text or text == "auto":
+        return ""
+    return text.split("-", 1)[0]
+
+
+def resolve_translation(
+    language: str, target_language: str, translate_requested: bool
+) -> tuple[bool, str]:
+    """Decide whether translation is needed.
+
+    Returns ``(translate_enabled, skip_reason)``.  A same-language request
+    (zh->zh, en-US->en) is treated as "no translation" instead of asking NLLB
+    to translate a sentence into its own language.
+    """
+    if not translate_requested or not str(target_language or "").strip():
+        return False, ""
+    source_base = _language_base(language)
+    target_base = _language_base(target_language)
+    if source_base and source_base == target_base:
+        return False, "same_language"
+    return True, ""
+
+
+def resolve_context(language: str, raw_context: str) -> str:
+    """Pick the decoder prompt: explicit query value first, zh gets a default."""
+    context = str(raw_context or "").strip()
+    if not context and _language_base(language).startswith("zh"):
+        context = DEFAULT_ZH_CONTEXT
+    return context[:MAX_CONTEXT_CHARS]
+
+
 def build_engine(args: argparse.Namespace):
     from whisperlivekit.config import WhisperLiveKitConfig
     from whisperlivekit.core import TranscriptionEngine
@@ -133,14 +171,19 @@ class Bridge:
         language = _query_value(query, "language", "auto") or "auto"
         target_language = _query_value(query, "target_language", "")
         translate_requested = _as_bool(_query_value(query, "translate", "0"))
-        translate_enabled = bool(translate_requested and target_language)
-        context = _query_value(query, "context", "")
+        translate_enabled, translate_skip_reason = resolve_translation(
+            language, target_language, translate_requested
+        )
+        context = resolve_context(language, _query_value(query, "context", ""))
 
         session_id = os.urandom(4).hex()
         log(
             f"session {session_id}: language={language!r} "
-            f"target={target_language!r} translate={translate_enabled}"
+            f"target={target_language!r} translate={translate_enabled} "
+            f"context_chars={len(context)}"
         )
+        if translate_skip_reason:
+            log(f"session {session_id}: translation skipped ({translate_skip_reason})")
         if translate_enabled:
             # Load NLLB while audio is streaming; captions never wait for it.
             self.translator.preload()
@@ -155,19 +198,20 @@ class Bridge:
 
         pump: Optional[asyncio.Task] = None
         try:
+            config_frame = {
+                "type": "config",
+                "sample_rate": 16000,
+                "channels": 1,
+                "format": "s16le",
+                "mode": "full",
+                "translate": translate_enabled,
+                "translate_ready": self.translator.ready,
+                "translate_skipped": bool(translate_skip_reason),
+            }
+            if translate_skip_reason:
+                config_frame["reason"] = translate_skip_reason
             await websocket.send(
-                json.dumps(
-                    {
-                        "type": "config",
-                        "sample_rate": 16000,
-                        "channels": 1,
-                        "format": "s16le",
-                        "mode": "full",
-                        "translate": translate_enabled,
-                        "translate_ready": self.translator.ready,
-                    },
-                    ensure_ascii=False,
-                )
+                json.dumps(config_frame, ensure_ascii=False)
             )
 
             pump = asyncio.create_task(

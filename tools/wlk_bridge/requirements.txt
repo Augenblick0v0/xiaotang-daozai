@@ -9,3 +9,6 @@ whisperlivekit[translation]==0.2.28
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
 
+
+# 繁体→简体：Whisper 的中文输出常带繁体，上屏前统一转成简体。
+opencc-python-reimplemented>=0.1.7

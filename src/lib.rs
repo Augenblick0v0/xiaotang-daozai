@@ -73,6 +73,7 @@ pub mod music_volume;
 pub mod caption_audio;
 pub mod caption;
 pub mod caption_runtime;
+pub mod caption_history;
 pub mod caption_ui;
 pub mod theme;
 pub mod settings_theme;

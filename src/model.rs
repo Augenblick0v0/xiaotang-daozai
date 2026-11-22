@@ -313,6 +313,11 @@ pub struct Settings {
     pub caption_autostart: bool,
     /// 实时字幕音源：0 = 系统声音，1 = 麦克风。
     pub caption_source: u8,
+    /// 实时字幕识别语言：zh / en / mixed（中英混合）/ ja / ko。
+    /// 固定语言比 auto 稳得多：auto 会把中文听成日文、把粤语听成英文。
+    pub caption_lang: String,
+    /// 实时字幕记录保存上限（MB），超出从最旧的字幕开始删。
+    pub caption_history_mb: u32,
     /// 实时字幕：是否同时显示译文。
     pub caption_translate: bool,
     /// 实时字幕：译文目标语言（NLLB 短码，如 zh / en）。
@@ -333,7 +338,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 12], page_order: [0,1,2,3,4,5,6,7,8,9,10,11], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, qq_avatar:true, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), task_sources: [true;3], task_keep_minutes: 30, task_hide_project: false, task_island_speed: true, task_island_progress: true, download_sources: [false,false,true], download_keep_minutes: 1440, download_island: true, download_island_speed: true, download_confirm_delete: true, caption_enabled: false, caption_autostart: false, caption_source: 0, caption_translate: false, caption_target_lang: "zh".into(), caption_show_partial: true, caption_on_island: true, caption_python: String::new(), caption_model: "base".into(), caption_device: 0, caption_beam: 1 }
+        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 12], page_order: [0,1,2,3,4,5,6,7,8,9,10,11], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, qq_avatar:true, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), task_sources: [true;3], task_keep_minutes: 30, task_hide_project: false, task_island_speed: true, task_island_progress: true, download_sources: [false,false,true], download_keep_minutes: 1440, download_island: true, download_island_speed: true, download_confirm_delete: true, caption_enabled: false, caption_autostart: false, caption_source: 0, caption_lang: "zh".into(), caption_history_mb: 20, caption_translate: false, caption_target_lang: "zh".into(), caption_show_partial: true, caption_on_island: true, caption_python: String::new(), caption_model: "base".into(), caption_device: 0, caption_beam: 1 }
     }
 }
 
@@ -458,6 +463,8 @@ impl Settings {
                 "caption_enabled" => s.caption_enabled = v=="1",
                 "caption_autostart" => s.caption_autostart = v=="1",
                 "caption_source" => s.caption_source = v.parse::<u8>().ok().filter(|v|*v<=1).unwrap_or(0),
+                "caption_lang" => { if matches!(v.as_str(),"zh"|"en"|"mixed"|"ja"|"ko") { s.caption_lang = v.to_string(); } }
+                "caption_history_mb" => s.caption_history_mb = v.parse::<u32>().ok().filter(|v|(1..=500).contains(v)).unwrap_or(20),
                 "caption_translate" => s.caption_translate = v=="1",
                 "caption_target_lang" => {
                     if matches!(v.as_str(),"zh"|"en"|"ja"|"ko") { s.caption_target_lang = v.to_string(); }
@@ -568,6 +575,8 @@ impl Settings {
                 ("caption_enabled".into(), (self.caption_enabled as u8).to_string()),
                 ("caption_autostart".into(), (self.caption_autostart as u8).to_string()),
                 ("caption_source".into(), self.caption_source.to_string()),
+            ("caption_lang".into(), self.caption_lang.clone()),
+            ("caption_history_mb".into(), self.caption_history_mb.to_string()),
                 ("caption_translate".into(), (self.caption_translate as u8).to_string()),
                 ("caption_target_lang".into(), self.caption_target_lang.clone()),
                 ("caption_show_partial".into(), (self.caption_show_partial as u8).to_string()),
@@ -1111,3 +1120,4 @@ impl NotificationApps {
         self.items.push((id.to_string(),name.to_string(),enabled));self.save();enabled
     }
 }
+
