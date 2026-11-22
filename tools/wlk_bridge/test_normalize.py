@@ -74,6 +74,17 @@ class SplitSentencesTests(unittest.TestCase):
         self.assertEqual(remainder, "第二句")
 
 
+class PromptEchoTests(unittest.TestCase):
+    def test_prompt_echo_is_dropped(self):
+        event = to_caption_event(_front("请使用简体中文。"), 1, False)
+        self.assertEqual(event["lines"], [])
+
+    def test_real_sentence_mentioning_the_phrase_is_kept(self):
+        text = "他在会上提醒大家，字幕设置里可以打开翻译，而不是一直说请使用简体中文。"
+        event = to_caption_event(_front(text), 1, False)
+        self.assertEqual(len(event["lines"]), 1)
+
+
 class CaptionIdTests(unittest.TestCase):
     def test_ids_stay_stable_while_text_grows(self):
         full = "这是一个没有标点符号的中文长句子我们用它来测试分段逻辑是否正确以及每一段的长度是否都在限制范围之内并且编号保持不变"

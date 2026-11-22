@@ -53,6 +53,9 @@ pub struct View {
     /// 本次会话的完整记录：按 id 合并全部字幕（面板只摊最近几行，
     /// 记录页/导出要的是全量）。侧车每次发的是快照，不能直接替换历史。
     pub history: Vec<Line>,
+    /// 当前这场会话在 `history` 里的起点；岛上只显示这场的新句子，
+    /// 上一场留下的旧字幕留在记录页里，但不会一直挂在岛上。
+    pub session_start: usize,
     /// 还没定稿的那半句（侧车的 buffer_transcription）。
     pub partial: String,
     pub error: Option<String>,
@@ -142,7 +145,7 @@ impl Captions {
             // 换一次会话不清记录：上一场的句子还留在页面上，可以继续往回翻，
             // 真正要清空时用「清空」按钮。
             let history = std::mem::take(&mut shared.view.history);
-            let lines = std::mem::take(&mut shared.view.lines);
+            let session_start = history.len();
             shared.view = View {
                 status: Status::Starting,
                 stage: "正在准备识别引擎…".into(),
@@ -150,7 +153,7 @@ impl Captions {
                 target: cfg.target.clone(),
                 model: cfg.model.clone(),
                 history,
-                lines,
+                session_start,
                 ..Default::default()
             };
         }
@@ -511,6 +514,7 @@ fn apply(shared: &Arc<Mutex<Shared>>, text: &str) {
                 view.lines = view
                     .history
                     .iter()
+                    .skip(view.session_start)
                     .rev()
                     .take(6)
                     .rev()

@@ -429,7 +429,7 @@ def _merge_short_fragments(lines: list[dict]) -> list[dict]:
     merged: list[dict] = []
     for line in lines:
         text = str(line.get("text") or "").strip()
-        if not text:
+        if not text or _is_prompt_echo(text):
             continue
         if merged:
             previous = merged[-1]
@@ -502,6 +502,21 @@ def _dedupe_lines(lines: list[dict]) -> list[dict]:
         out.append(line)
     out.reverse()
     return out[-64:]
+
+
+_PROMPT_ECHO = ("使用简体中文", "以下是普通话的句子", "请使用简体")
+
+
+def _is_prompt_echo(text: str) -> bool:
+    """Whisper 会把「请使用简体中文」这类提示词当音频内容吐出来。
+
+    我们早先给中文会话塞过一句识别提示，模型在纯音乐/静音段会把它复读；
+    这类行不是用户说的话，长度又很短，直接丢掉，别污染记录。
+    """
+    stripped = text.strip()
+    if len(stripped) > 20:
+        return False
+    return any(piece in stripped for piece in _PROMPT_ECHO)
 
 
 def to_caption_event(
@@ -606,5 +621,6 @@ def to_caption_event(
         "partial": _to_simplified(str(front_dict.get("buffer_transcription") or ""), top_lang),
         "buffer_translation": str(front_dict.get("buffer_translation") or ""),
     }
+
 
 
