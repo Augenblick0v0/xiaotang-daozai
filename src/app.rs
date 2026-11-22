@@ -976,8 +976,21 @@ impl App {
             model::config_dir().join("caption-history.jsonl"),
             (settings.caption_history_mb as usize).max(1) * 1024 * 1024,
         );
-        // 每次启动都从空白一屏开始；上一场的记录已经存在磁盘里，仍可导出。
-        let caption_saved = 0usize;
+        // 上次会话的记录先铺进页面：停止、重启之后都还能往回翻。
+        let caption_seed: Vec<crate::caption::Line> = caption_history
+            .entries()
+            .iter()
+            .map(|entry| crate::caption::Line {
+                id: entry.id.clone(),
+                text: entry.text.clone(),
+                translation: entry.translation.clone(),
+                lang: entry.lang.clone(),
+                start: entry.start,
+                end: entry.end,
+                done: true,
+            })
+            .collect();
+        let caption_saved = caption_seed.len();
         let (bw, bh) = if settings.minimal { (BAR_W_MIN, BAR_H_MIN) } else { (BAR_W, BAR_H) };
         let focus_seconds=settings.focus_minutes as f32*60.0;
         let initial_lyrics=settings.lyrics_enabled;
@@ -1110,7 +1123,9 @@ impl App {
         download_confirm: None,
         download_dismissed: None,
         caption: {
-            crate::caption::Captions::new()
+            let mut captions = crate::caption::Captions::new();
+            captions.seed_history(caption_seed);
+            captions
         },
         caption_cfg: None,
         caption_install: crate::caption_ui::Installer::new(),

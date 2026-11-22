@@ -5,7 +5,7 @@
 //! 翻成了什么」。技术细节（设备、模型、侧车日志）收在最下面一行小字里。
 use crate::app::*;
 pub(crate) use crate::caption::language_tag;
-use crate::caption::{language_name, Line, StartConfig, Status};
+use crate::caption::{language_name, StartConfig, Status};
 use crate::caption_audio::CaptureSource;
 use crate::paint::{Card, H};
 use crate::theme::{self, size, W};
@@ -160,8 +160,12 @@ impl App {
                 || old.beam != cfg.beam
         });
         if !self.caption.active() {
-            self.caption_epoch = Self::epoch_secs();
-            self.caption.start(cfg.clone());
+            // 只在「还没起过」时拉起一次。线程挂了（侧车报错、端口冲突）就停在
+            // Failed 上让用户看见，别每帧重启——那会让岛在两种高度之间来回跳。
+            if self.caption_cfg.is_none() {
+                self.caption_epoch = Self::epoch_secs();
+                self.caption.start(cfg.clone());
+            }
             self.caption_cfg = Some(cfg.clone());
         } else if changed {
             self.caption.stop();
@@ -170,7 +174,7 @@ impl App {
             self.caption_cfg = Some(cfg.clone());
         }
         // 安装完成后自动接着启动（用户刚装完不该再点一次）。
-        if !self.caption.active() && self.caption_install.view().finished {
+        if !self.caption.active() && self.caption_cfg.is_none() && self.caption_install.view().finished {
             self.caption_epoch = Self::epoch_secs();
             self.caption.start(cfg.clone());
             self.caption_cfg = Some(cfg.clone());
@@ -348,7 +352,8 @@ impl App {
             list_top = 114.0;
         }
 
-        if view.status == Status::Off && !self.settings.caption_enabled {
+        // 上一场的记录还在时优先把记录铺出来，别用引导文案把它盖住。
+        if view.status == Status::Off && !self.settings.caption_enabled && view.history.is_empty() {
             let top = list_top;
             c.text(15.0, top + 18.0, "把正在放的声音变成字幕", 12.5, W::Semibold, theme::WHITE, H::Left);
             let hint = c.fit(
@@ -358,8 +363,13 @@ impl App {
                 380.0,
             );
             c.text(15.0, top + 36.0, &hint, 10.5, W::Regular, theme::GRAY, H::Left);
-            c.text(15.0, top + 66.0, "需要先装一次识别环境（约 2.5 GB，只装一次）", 10.0, W::Regular, theme::DIM, H::Left);
             let ready = crate::caption_runtime::installed();
+            let setup = if ready {
+                "识别环境已就绪，点「开启」开始"
+            } else {
+                "需要先装一次识别环境（约 2.5 GB，只装一次）"
+            };
+            c.text(15.0, top + 66.0, setup, 10.0, W::Regular, theme::DIM, H::Left);
             let (hit, inner) = crate::paint::capsule(
                 c,
                 15.0,
@@ -425,12 +435,17 @@ impl App {
                 c.text(15.0, list_top + 24.0, &waiting, 11.0, W::Regular, if view.status == Status::Failed { theme::RED } else { theme::DIM }, H::Left);
             }
         } else {
-            let offset = if self.caption_follow { f32::MAX / 2.0 } else { self.caption_scroll };
-            let output = egui::ScrollArea::vertical()
+            let mut area = egui::ScrollArea::vertical()
                 .id_salt("caption-history-scroll")
-                .auto_shrink([false, false])
-                .vertical_scroll_offset(offset)
-                .show_rows(&mut content, row_h * c.s, history.len(), |ui, range| {
+                .auto_shrink([false, false]);
+            // 跟随新句子时交给 egui 自己贴底；手动翻过页才用记下来的偏移。
+            // 之前用 f32::MAX/2 当「到底」，egui 会因为偏移越界直接 panic。
+            area = if self.caption_follow {
+                area.stick_to_bottom(true)
+            } else {
+                area.vertical_scroll_offset(self.caption_scroll)
+            };
+            let output = area.show_rows(&mut content, row_h * c.s, history.len(), |ui, range| {
                     for index in range {
                         let line = &history[index];
                         let (rect, _) = ui.allocate_exact_size(egui::vec2(392.0 * c.s, row_h * c.s), egui::Sense::hover());
@@ -444,7 +459,13 @@ impl App {
                         row.text(22.0, 11.0, &text, 12.0, W::Regular, if line.done { theme::WHITE } else { theme::GRAY }, H::Left);
                         if show_translation {
                             let translated = if line.translation.trim().is_empty() {
-                                if line.done { "翻译中…".to_string() } else { String::new() }
+                                // 只有「本场最后一句、还在跑」才值得显示占位；
+                                // 上一场留下来的老记录没有译文就是没有，别装作还在翻。
+                                if view.status == Status::Running && index + 1 == history.len() {
+                                    "翻译中…".to_string()
+                                } else {
+                                    String::new()
+                                }
                             } else {
                                 line.translation.clone()
                             };

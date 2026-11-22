@@ -364,6 +364,19 @@ def _visible_len(text: str) -> int:
     return len("".join(str(text).split()))
 
 
+_PUNCT_RE = re.compile(r"[\s\.,!?;:，。！？；：、…\"'“”‘’()（）\[\]【】-]+")
+
+
+def _dedupe_key(text) -> str:
+    """Comparison key that ignores spacing and punctuation differences.
+
+    WLK re-emits a sentence after its buffer is trimmed; the new copy often
+    differs only by a trailing comma or a stray space.  Comparing the raw text
+    left both rows on screen, which read as the sentence being printed twice.
+    """
+    return _PUNCT_RE.sub("", str(text or "")).lower()
+
+
 def _dedupe_lines(lines: list[dict]) -> list[dict]:
     """Collapse duplicate rows, preferring line id over text.
 
@@ -393,7 +406,7 @@ def _dedupe_lines(lines: list[dict]) -> list[dict]:
     seen_text: set[str] = set()
     out: list[dict] = []
     for line in reversed(candidates):
-        text = " ".join(str(line.get("text") or "").split()).lower()
+        text = _dedupe_key(line.get("text"))
         if not text or text in seen_text:
             continue
         seen_text.add(text)

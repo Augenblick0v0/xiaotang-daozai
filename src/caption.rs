@@ -139,12 +139,18 @@ impl Captions {
         let (tx, rx) = mpsc::channel::<Cmd>();
         {
             let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+            // 换一次会话不清记录：上一场的句子还留在页面上，可以继续往回翻，
+            // 真正要清空时用「清空」按钮。
+            let history = std::mem::take(&mut shared.view.history);
+            let lines = std::mem::take(&mut shared.view.lines);
             shared.view = View {
                 status: Status::Starting,
                 stage: "正在准备识别引擎…".into(),
                 translate: cfg.translate,
                 target: cfg.target.clone(),
                 model: cfg.model.clone(),
+                history,
+                lines,
                 ..Default::default()
             };
         }
@@ -497,6 +503,7 @@ fn apply(shared: &Arc<Mutex<Shared>>, text: &str) {
                         view.history.push(line);
                     }
                 }
+                dedupe_history(&mut view.history);
                 if view.history.len() > 2000 {
                     let drop = view.history.len() - 2000;
                     view.history.drain(0..drop);
@@ -540,6 +547,46 @@ fn apply(shared: &Arc<Mutex<Shared>>, text: &str) {
         _ => {}
     }
 }
+
+/// 同一句话在 WLK 里可能换一个 id 再发一遍（缓冲裁剪后会重排），
+/// 直接按 id 合并就会在记录里留下两条一模一样的句子。
+/// 这里按「忽略空白和标点」的文本再收一次，保留最新那条；新的一条没有译文时
+/// 沿用旧译文，避免译文被重发冲掉。
+fn dedupe_history(history: &mut Vec<Line>) {
+    fn key(text: &str) -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && !matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '。' | '，' | '！' | '？' | '；' | '：' | '、' | '…' | '\u{201c}' | '\u{201d}' | '\u{2018}' | '\u{2019}'))
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+
+    // 从后往前扫：先见到的是最新的一份，重复的旧句子只用来补译文。
+    // 用 HashMap 而不是两两比较，2000 行的记录每帧也不会变成 O(n²)。
+    let mut latest: std::collections::HashMap<String, Line> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for line in history.drain(..).rev() {
+        let text_key = key(&line.text);
+        if text_key.is_empty() {
+            continue;
+        }
+        if let Some(existing) = latest.get_mut(&text_key) {
+            if existing.translation.trim().is_empty() {
+                existing.translation = line.translation;
+            }
+            continue;
+        }
+        order.push(text_key.clone());
+        latest.insert(text_key, line);
+    }
+    let mut kept = Vec::with_capacity(order.len());
+    for text_key in order.into_iter().rev() {
+        if let Some(line) = latest.remove(&text_key) {
+            kept.push(line);
+        }
+    }
+    *history = kept;
+}
+
 
 fn publish(shared: &Arc<Mutex<Shared>>, edit: impl FnOnce(&mut View)) {
     if let Ok(mut shared) = shared.lock() {
@@ -700,5 +747,31 @@ mod tests {
         apply(&captions.shared, r#"{"type":"unknown"}"#);
         assert_eq!(captions.view().status, Status::Off);
     }
-}
 
+    fn sample_line(id: &str, text: &str, translation: &str) -> Line {
+        Line { id: id.into(), text: text.into(), translation: translation.into(), lang: "zh".into(), start: 0.0, end: 1.0, done: true }
+    }
+
+    #[test]
+    fn history_keeps_one_copy_of_a_sentence_that_changed_id() {
+        let mut history = vec![
+            sample_line("a", "今天我们要讨论发布计划。", ""),
+            sample_line("b", "别的句子。", ""),
+            sample_line("c", "今天我们要讨论发布计划", "今天我们要讨论发布计划。"),
+        ];
+        dedupe_history(&mut history);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].id, "c");
+        assert_eq!(history[1].translation, "今天我们要讨论发布计划。");
+    }
+
+    #[test]
+    fn seeded_history_shows_before_a_new_session() {
+        let mut captions = Captions::new();
+        captions.seed_history(vec![sample_line("a", "上一场的一句话。", "")]);
+        assert_eq!(captions.view().history.len(), 1);
+        assert_eq!(captions.view().lines.len(), 1);
+        captions.clear_history();
+        assert!(captions.view().history.is_empty());
+    }
+}
