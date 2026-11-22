@@ -163,39 +163,40 @@ impl App {
             // 只在「还没起过」时拉起一次。线程挂了（侧车报错、端口冲突）就停在
             // Failed 上让用户看见，别每帧重启——那会让岛在两种高度之间来回跳。
             if self.caption_cfg.is_none() {
-                self.caption_epoch = Self::epoch_secs();
                 self.caption.start(cfg.clone());
             }
             self.caption_cfg = Some(cfg.clone());
         } else if changed {
             self.caption.stop();
-            self.caption_epoch = Self::epoch_secs();
             self.caption.start(cfg.clone());
             self.caption_cfg = Some(cfg.clone());
         }
         // 安装完成后自动接着启动（用户刚装完不该再点一次）。
         if !self.caption.active() && self.caption_cfg.is_none() && self.caption_install.view().finished {
-            self.caption_epoch = Self::epoch_secs();
             self.caption.start(cfg.clone());
             self.caption_cfg = Some(cfg.clone());
         }
         // 把新定稿的字幕并进落盘记录（按 id 去重；攒够一批再写，别每帧刷盘）。
         let view = self.caption.view();
-        if view.history.len() > self.caption_saved {
-            for line in view.history.iter().skip(self.caption_saved) {
-                self.caption_history.record(crate::caption_history::Entry {
-                    id: format!("{}-{}", self.caption_epoch, line.id),
-                    text: line.text.clone(),
-                    translation: line.translation.clone(),
-                    lang: line.lang.clone(),
-                    start: line.start,
-                    end: line.end,
-                });
+        let mut dirty = false;
+        for line in &view.history {
+            let translation = line.translation.clone();
+            if self.caption_saved.get(&line.id) == Some(&translation) {
+                continue;
             }
-            self.caption_saved = view.history.len();
+            self.caption_history.record(crate::caption_history::Entry {
+                id: line.id.clone(),
+                text: line.text.clone(),
+                translation,
+                lang: line.lang.clone(),
+                start: line.start,
+                end: line.end,
+            });
+            self.caption_saved.insert(line.id.clone(), line.translation.clone());
+            dirty = true;
+        }
+        if dirty {
             let _ = self.caption_history.flush();
-        } else if view.history.len() < self.caption_saved {
-            self.caption_saved = view.history.len();
         }
     }
 

@@ -454,8 +454,11 @@ impl eframe::App for Shell {
                 self.system_ready=true;
                 self.fullscreen=observation.fullscreen;
             }
-            self.hidden=daozai::display_layout::hide_for_fullscreen(self.app.settings.hide_fullscreen,self.fullscreen,daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id).map(|d|d.bounds));
-            // 毛玻璃：在岛体左右两侧和画布底边（都在窗口区域之外）取样，估计岛背后的明暗。
+            // 看视频时全屏隐藏会自动生效，但实时字幕正是给全屏视频用的，
+            // 所以字幕在跑的时候绕过这条规则，否则字幕永远看不到。
+            let caption_visible=self.app.caption_bar_visible();
+            self.hidden=!caption_visible&&daozai::display_layout::hide_for_fullscreen(self.app.settings.hide_fullscreen,self.fullscreen,daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id).map(|d|d.bounds));
+                        // 毛玻璃：在岛体左右两侧和画布底边（都在窗口区域之外）取样，估计岛背后的明暗。
             if self.app.settings.skin.is_glass() && !self.hidden {
                 let sampler=self.backdrop.get_or_insert_with(daozai::backdrop::Sampler::start);
                 let ppp=ctx.pixels_per_point();

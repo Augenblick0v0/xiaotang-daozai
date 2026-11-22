@@ -231,9 +231,20 @@ _REDUPLICATED = set("看试说想谢妈爸哥姐弟妹宝星刚常渐慢悄偷�
 
 
 def _collapse_repeats(text: str) -> str:
+    """只在块边界上折叠多出来的一个重复汉字。
+
+    说话人真的连说两个「哈哈」很常见，把整段重复压成一个字属于文本损坏；
+    这里只处理连续两个相同汉字且该字不在常用叠字表里的情况（如「欢迎迎来到」）。
+    """
     out: list[str] = []
+    run_char = ""
+    run_len = 0
     for ch in str(text):
-        if out and ch == out[-1] and ch not in _REDUPLICATED and "\u4e00" <= ch <= "\u9fff":
+        if ch == run_char:
+            run_len += 1
+        else:
+            run_char, run_len = ch, 1
+        if run_len == 2 and ch not in _REDUPLICATED and "\u4e00" <= ch <= "\u9fff":
             continue
         out.append(ch)
     return "".join(out)
@@ -367,6 +378,8 @@ def _strip_tail_echo(text: str, earlier: list[str]) -> str:
         return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
 
     cleaned = " ".join(str(text or "").split())
+    if len(cleaned.split()) < 4:
+        return text
     for previous in reversed(earlier[-3:]):
         tail = bare(previous)
         if len(tail) < 8 or len(bare(cleaned)) <= len(tail):

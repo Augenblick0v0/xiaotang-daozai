@@ -66,6 +66,10 @@ pub struct View {
     pub model: String,
     /// 最近一次收到字幕快照的时刻（用于「多久没动静」）。
     pub last_at: Option<Instant>,
+    /// 每次真正连上侧车加一，用来给行 id 加会话前缀，避免重连后撞上旧记录。
+    pub conn: u64,
+    /// 本连接里侧车的原始行 id → 历史行 id。
+    pub ids: std::collections::HashMap<String, String>,
 }
 
 /// 一次启动需要的参数（从 `Settings` 拷过来，线程里不再碰 UI 状态）。
@@ -325,6 +329,12 @@ fn session(
         let _ = tcp.set_read_timeout(Some(Duration::from_millis(25)));
         let _ = tcp.set_nodelay(true);
     }
+    // 新连接意味着侧车从零开始编号；给 id 加连接前缀，否则会和上一场的历史撞车。
+    publish(shared, |view| {
+        view.conn += 1;
+        view.ids.clear();
+        view.session_start = view.history.len();
+    });
     let mut capture = match crate::caption_audio::Capture::start(cfg.source) {
         Ok(capture) => capture,
         Err(error) => {
@@ -490,10 +500,17 @@ fn apply(shared: &Arc<Mutex<Shared>>, text: &str) {
                 // 侧车给的是「当前缓冲区的快照」：整段话会被反复重发，
                 // 直接覆盖会让记录只剩最后几行。按 id 并进历史，
                 // 同一句增长时原地更新，新句才追加。
-                for line in lines {
+                for mut line in lines {
                     if line.text.trim().is_empty() {
                         continue;
                     }
+                    let raw_id = line.id.clone();
+                    let mapped = view
+                        .ids
+                        .entry(raw_id.clone())
+                        .or_insert_with(|| format!("{}-{raw_id}", view.conn))
+                        .clone();
+                    line.id = mapped;
                     if let Some(existing) = view.history.iter_mut().find(|old| old.id == line.id) {
                         existing.text = line.text;
                         if !line.translation.trim().is_empty() {
@@ -506,10 +523,13 @@ fn apply(shared: &Arc<Mutex<Shared>>, text: &str) {
                         view.history.push(line);
                     }
                 }
-                dedupe_history(&mut view.history);
+                dedupe_history(&mut view.history, view.session_start);
                 if view.history.len() > 2000 {
                     let drop = view.history.len() - 2000;
                     view.history.drain(0..drop);
+                    // 记录裁掉最旧的行时，本场会话的起点要跟着往前挪，
+                    // 否则 index 会永远指在列表末尾之外，岛上一条也不显示。
+                    view.session_start = view.session_start.saturating_sub(drop);
                 }
                 view.lines = view
                     .history
@@ -520,6 +540,12 @@ fn apply(shared: &Arc<Mutex<Shared>>, text: &str) {
                     .rev()
                     .cloned()
                     .collect();
+                if let Ok(path) = std::env::var("DAOZAI_CAPTION_DEBUG") {
+                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        use std::io::Write;
+                        let _ = writeln!(file, "{{\"view\":true,\"session_start\":{},\"history\":{},\"lines\":{}}}", view.session_start, view.history.len(), view.lines.len());
+                    }
+                }
                 view.last_at = Some(Instant::now());
             });
         }
@@ -530,6 +556,7 @@ fn apply(shared: &Arc<Mutex<Shared>>, text: &str) {
                 return;
             }
             publish(shared, |view| {
+                let id = view.ids.get(&id).cloned().unwrap_or(id);
                 if let Some(line) = view.lines.iter_mut().find(|line| line.id == id) {
                     line.translation = translation.clone();
                 }
@@ -556,7 +583,7 @@ fn apply(shared: &Arc<Mutex<Shared>>, text: &str) {
 /// 直接按 id 合并就会在记录里留下两条一模一样的句子。
 /// 这里按「忽略空白和标点」的文本再收一次，保留最新那条；新的一条没有译文时
 /// 沿用旧译文，避免译文被重发冲掉。
-fn dedupe_history(history: &mut Vec<Line>) {
+fn dedupe_history(history: &mut Vec<Line>, from: usize) {
     fn key(text: &str) -> String {
         text.chars()
             .filter(|c| !c.is_whitespace() && !matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '。' | '，' | '！' | '？' | '；' | '：' | '、' | '…' | '\u{201c}' | '\u{201d}' | '\u{2018}' | '\u{2019}'))
@@ -564,11 +591,15 @@ fn dedupe_history(history: &mut Vec<Line>) {
             .collect()
     }
 
+    // 只收本场会话那一段：旧记录是已经落过盘的，一帧里再合并会把
+    // 它们的条数变少，session_start 就指到列表外面去，岛上会一条都不显示。
+    let from = from.min(history.len());
+    let mut tail: Vec<Line> = history.split_off(from);
     // 从后往前扫：先见到的是最新的一份，重复的旧句子只用来补译文。
     // 用 HashMap 而不是两两比较，2000 行的记录每帧也不会变成 O(n²)。
     let mut latest: std::collections::HashMap<String, Line> = std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    for line in history.drain(..).rev() {
+    for line in tail.drain(..).rev() {
         let text_key = key(&line.text);
         if text_key.is_empty() {
             continue;
@@ -588,7 +619,7 @@ fn dedupe_history(history: &mut Vec<Line>) {
             kept.push(line);
         }
     }
-    *history = kept;
+    history.extend(kept);
 }
 
 
@@ -763,10 +794,56 @@ mod tests {
             sample_line("b", "别的句子。", ""),
             sample_line("c", "今天我们要讨论发布计划", "今天我们要讨论发布计划。"),
         ];
-        dedupe_history(&mut history);
+        dedupe_history(&mut history, 0);
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].id, "c");
         assert_eq!(history[1].translation, "今天我们要讨论发布计划。");
+    }
+
+    #[test]
+    fn a_new_session_keeps_the_island_feed_alive() {
+        let mut captions = Captions::new();
+        captions.seed_history(vec![
+            sample_line("a", "上一场的第一句。", ""),
+            sample_line("b", "上一场的第二句。", ""),
+        ]);
+        captions.start(StartConfig {
+            source: crate::caption_audio::CaptureSource::SystemLoopback,
+            lang: "zh".into(),
+            translate: false,
+            target: "en".into(),
+            python: String::new(),
+            model: "base".into(),
+            force_cpu: true,
+            beam: 1,
+        });
+        // start() 之后 session_start 必须等于已有的历史条数，
+        // 第一帧新字幕不能被旧记录挡住。
+        assert_eq!(captions.view().session_start, 2);
+        apply(
+            &captions.shared,
+            r#"{"type":"captions","seq":1,"status":"active","lang":"zh","lines":[{"id":"L0000-00000000-00","text":"新的一场开始了。","translation":"","lang":"zh","start":"0:00:00.00","end":"0:00:01.00","final":true}]}"#,
+        );
+        let view = captions.view();
+        assert_eq!(view.lines.len(), 1);
+        assert_eq!(view.lines[0].text, "新的一场开始了。");
+    }
+
+    #[test]
+    fn old_duplicates_do_not_shrink_the_part_before_the_session() {
+        // 上一场存下来的记录本身就有重复。去重只收拾本场那一段，
+        // 否则条数一变少，session_start 就指到列表外面，岛上永远空着。
+        let mut history = vec![
+            sample_line("old-1", "上一场的一句话。", ""),
+            sample_line("old-2", "上一场的一句话。", ""),
+        ];
+        dedupe_history(&mut history, 2);
+        assert_eq!(history.len(), 2, "旧记录不能被本场去重吃掉");
+
+        history.push(sample_line("new-1", "新的一场开始了。", ""));
+        dedupe_history(&mut history, 2);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.last().map(|l| l.text.as_str()), Some("新的一场开始了。"));
     }
 
     #[test]

@@ -418,7 +418,10 @@ class Bridge:
                                 waiting[task_key] = line_id
 
                     for line in event["lines"]:
-                        if line["id"] in translations:
+                        if (
+                            line["id"] in translations
+                            and submitted_text.get(line["id"], line["text"]) == line["text"]
+                        ):
                             line["translation"] = translations[line["id"]]
 
                     body_obj = {key: value for key, value in event.items() if key != "seq"}

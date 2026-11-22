@@ -946,7 +946,7 @@ pub struct App {
     /// 落盘的字幕记录（跨重启，按上限自动裁剪）。
     pub(crate) caption_history: crate::caption_history::History,
     /// 已经并进 `caption_history` 的条数，用来增量追加。
-    pub(crate) caption_saved: usize,
+    pub(crate) caption_saved: std::collections::HashMap<String, String>,
     /// 页面上的导出/清空结果提示（文本 + 出现时刻）。
     pub(crate) caption_notice: Option<(String, std::time::Instant)>,
     /// 清空按钮的第一下（5 秒内再点才真清），防误触。
@@ -956,7 +956,6 @@ pub struct App {
     /// 记录列表可滚动到底的最大偏移，由列表渲染时回报。
     pub(crate) caption_max_scroll: f32,
     pub(crate) caption_follow: bool,
-    pub(crate) caption_epoch: u64,
     /// 开机自动开启字幕只做一次，之后尊重用户的手动开关。
     caption_boot: bool,
 }
@@ -1132,13 +1131,12 @@ impl App {
         caption_cfg: None,
         caption_install: crate::caption_ui::Installer::new(),
         caption_history,
-        caption_saved,
+        caption_saved: std::collections::HashMap::new(),
         caption_notice: None,
         caption_clear_at: None,
         caption_scroll: 0.0,
         caption_max_scroll: 0.0,
             caption_follow: true,
-            caption_epoch: 0,
         caption_boot: false,
         }
     }
@@ -1828,13 +1826,18 @@ impl App {
         self.settings.island_lyrics && self.settings.visible_pages[0] && self.media.is_music() && self.media.playing
             && !self.browser_minimal_active
     }
+    /// 字幕条是否应当盖过全屏隐藏规则。主循环在 bin crate 里，不能读 crate 私有字段。
+    pub fn caption_bar_visible(&self)->bool {
+        let view=self.caption.view();
+        self.settings.caption_on_island
+            && !self.open
+            && view.status==crate::caption::Status::Running
+            && view.lines.last().is_some_and(|line|!line.text.trim().is_empty())
+    }
+
     /// 收起药丸上有没有实时字幕可画：开关打开、没展开、侧车在跑，且最近一句有原文。
     fn island_caption_active(&self)->bool {
-        if self.side() {return false;}
-        if !self.settings.caption_on_island || self.open {return false;}
-        let view=self.caption.view();
-        view.status==crate::caption::Status::Running
-            && view.lines.last().is_some_and(|line|!line.text.trim().is_empty())
+        !self.side() && self.caption_bar_visible()
     }
     /// 药丸上的滚动内容：歌词优先，歌词不在时用实时字幕。
     fn island_ticker_active(&self)->bool {self.island_lyrics_active()||self.island_caption_active()}
@@ -1933,6 +1936,11 @@ impl App {
         self.settings.minimal=enabled;if enabled {self.settings.pet=false;}self.settings.save();
     }
     fn base_size(&self) -> (f32, f32) {
+        // 实时字幕在跑的时候，药丸优先给字幕：通知/角标会把它整个盖掉，
+        // 用户看到的就是「开了字幕但岛上什么都没有」。
+        if !self.open && self.island_caption_active() {
+            return (self.caption_bar_width(),CAPTION_BAR_H);
+        }
         if !self.compact_notices()&&!self.open {
             if let Some(a)=&self.notice {let (width,height)=self.notice_size(a);return (width+self.pet_space(),height);}
         }
@@ -2121,8 +2129,9 @@ impl App {
                 let mail_reading=inside && self.page==5 && self.mail.open_uid.is_some();
                 let mail_list=self.page==5 && !self.mail.accounts.is_empty() && self.mail.open_uid.is_none() && self.mail_list_bounds().contains(cursor);
                 // 字幕页：鼠标在记录列表上时滚轮只滚列表，别把整页翻走。
+                let list_top=if self.caption.view().translate{114.0}else{90.0};
                 let caption_list=self.page==CAPTION_PAGE
-                    && Rect::from_min_max(Pos2::new(15.0,88.0),Pos2::new(404.0,238.0)).contains(cursor);
+                    && Rect::from_min_max(Pos2::new(15.0,list_top),Pos2::new(404.0,226.0)).contains(cursor);
                 let music_volume=self.page==0 && (Rect::from_min_max(Pos2::new(354.0,106.0),Pos2::new(380.0,130.0)).contains(cursor)
                     || self.music_volume_open && crate::pages::MUSIC_VOLUME_RECT.contains(cursor));
                 if caption_list {
@@ -2254,7 +2263,7 @@ impl App {
         let base = Card::new(ui, origin, clip);
         self.cursor_local = env.cursor.map(|p| base.to_local(p));
 
-        let banner=!self.compact_notices()&&self.notice.is_some()&&!self.open;
+        let banner=!self.compact_notices()&&self.notice.is_some()&&!self.open&&!self.island_caption_active();
         let restoring_lyrics=!self.open&&self.notice.is_none()&&self.island_ticker_active()&&self.hud_notice.as_ref().is_some_and(|a|a.meeting.is_some()||a.source!=crate::extras::AlertSource::Internal);
         let fading_hud=!self.compact_notices()&&!self.open&&self.hud_notice.as_ref().is_some_and(|a|a.is_hud())&&(banner||self.hud_alpha>0.003);
         if fading_hud {
