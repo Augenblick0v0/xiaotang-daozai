@@ -253,6 +253,30 @@ pub fn total_rate(items: &[TaskItem]) -> f32 {
         .sum()
 }
 
+/// 总速度的平滑：直接把每次扫描的合计贴到岛上，数字会随「这一步在出字还是在
+/// 跑工具」在两三个会话之间来回跳，看着像坏了。按时间常数慢慢靠近目标值，
+/// 会话换气（这一步没出字）时只往下掉一点，不会瞬间归零。
+pub fn smooth_rate(prev: f32, target: f32, dt_ms: i64) -> f32 {
+    if !prev.is_finite() || prev < 0.0 {
+        return target.max(0.0);
+    }
+    let target = target.max(0.0);
+    let dt = (dt_ms as f32 / 1000.0).clamp(0.0, 10.0);
+    if dt <= 0.0 {
+        return prev;
+    }
+    // 涨得快、落得慢：新会话一开始出字就立刻跟上去（1.5 秒），
+    // 而「这一步在跑工具、暂时没出字」的空档按 6 秒慢慢衰减，不会被当成 0。
+    let tau = if target > prev { 1.5 } else { 6.0 };
+    let alpha = 1.0 - (-dt / tau).exp();
+    let next = prev + (target - prev) * alpha;
+    if target <= 0.0 && next < 1.0 {
+        0.0
+    } else {
+        next
+    }
+}
+
 /// 父行要显示的合计速度：自己（还活着的话）加上它所有子 agent 会话。
 /// 子行只显示自己的 `rate`，别用这个 —— 否则父和子会把同一个数字显示两遍。
 /// `parent_id` 给 `TaskItem.parent` 里那个裸会话 id，给完整的 `dsh:<uuid>` 也认；
@@ -1769,6 +1793,64 @@ mod tests {
                 "子会话 {child} 被截断了：{items:?}"
             );
         }
+    }
+
+    /// 真机速度稳定性：每 2 秒采一次，看总速度到底在跳什么。
+    #[test]
+    #[ignore]
+    fn live_total_rate_stability() {
+        let roots = Roots::real();
+        let mut w = Watcher::new();
+        let mut smooth = 0.0f32;
+        for step in 0..15 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let cfg = ScanConfig { sources: [true; 3], keep_minutes: 240, now_ms: now_ms() };
+            w.tick(std::time::Instant::now(), cfg);
+            let items = w.items();
+            let total: f32 = total_rate(items);
+            let alive: Vec<String> = items
+                .iter()
+                .filter(|it| it.stage.alive())
+                .map(|it| format!("{}={:.1}", it.id, it.rate))
+                .collect();
+            smooth = smooth_rate(smooth, total, if step == 0 { 0 } else { 2000 });
+            println!(
+                "[{step:02}] 原始={total:.1} 平滑={smooth:.1} 在跑 {} 条：{}",
+                alive.len(),
+                alive.join("  ")
+            );
+            let needs: Vec<String> = items
+                .iter()
+                .filter(|it| it.stage.needs_user())
+                .map(|it| format!("{}={:.1}", it.id, it.rate))
+                .collect();
+            if !needs.is_empty() {
+                println!("     等你 {} 条：{}", needs.len(), needs.join("  "));
+            }
+        }
+        let _ = roots;
+    }
+
+    #[test]
+    fn smooth_rate_absorbs_short_gaps_between_scans() {
+        // 一步在出字一步在跑工具：直接贴原值会在 168 和 0 之间跳。
+        let mut v = 168.0;
+        v = smooth_rate(v, 0.0, 2000);
+        assert!(v > 90.0, "一个空档不该把速度打到 0：{v}");
+        v = smooth_rate(v, 168.0, 2000);
+        assert!(v > 120.0, "回到出字时应该回到接近原值：{v}");
+        // 真停下来（目标一直是 0）之后慢慢衰减到消失。
+        let mut idle = 120.0;
+        for _ in 0..20 {
+            idle = smooth_rate(idle, 0.0, 2000);
+        }
+        assert_eq!(idle, 0.0);
+        // 两个会话相加的目标值会稳定收敛过去。
+        let mut two = 0.0;
+        for _ in 0..6 {
+            two = smooth_rate(two, 178.7, 2000);
+        }
+        assert!((two - 178.7).abs() < 20.0, "总速度应收敛到合计值：{two}");
     }
 
     #[test]

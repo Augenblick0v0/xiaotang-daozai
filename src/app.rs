@@ -938,6 +938,11 @@ pub struct App {
     /// 报过完成的会话（id → 毫秒时间）：第一次扫描只记账不弹，避免历史完成全涌上来。
     pub(crate) task_banner_done: Vec<(String, i64)>,
     pub(crate) task_banner_primed: bool,
+    /// 岛角标显示的总速度（t/s）：原始值随「这一步在出字还是在跑工具」跳，
+    /// 这里按时间常数平滑后再画。
+    pub(crate) task_rate_ema: f32,
+    /// 上一次平滑的时间点（秒，跟 `self.t` 同一套时钟）。
+    pub(crate) task_rate_at: f64,
 }
 
 impl App {
@@ -1079,6 +1084,8 @@ impl App {
             task_banner_queue: Vec::new(),
             task_banner_done: Vec::new(),
             task_banner_primed: false,
+        task_rate_ema: 0.0,
+        task_rate_at: 0.0,
         }
     }
 
@@ -1835,6 +1842,28 @@ impl App {
     pub fn task_fold_open(&self, id: &str) -> bool {
         self.task_expanded.iter().any(|open| open == id)
     }
+    /// 把「全岛在跑会话的合计速度」平滑一格：相隔多久就按时间常数靠近多少，
+    /// 会话换气（这一步没出字）时只掉一点，不会瞬间归零。
+    pub(crate) fn task_rate_tick(&mut self) {
+        let target = crate::task_scan::total_rate(self.task.items());
+        if self.task_rate_at <= 0.0 {
+            self.task_rate_ema = target;
+            self.task_rate_at = self.t;
+            return;
+        }
+        let dt_ms = ((self.t - self.task_rate_at) * 1000.0).clamp(0.0, 10_000.0) as i64;
+        if dt_ms <= 0 {
+            return;
+        }
+        self.task_rate_ema = crate::task_scan::smooth_rate(self.task_rate_ema, target, dt_ms);
+        self.task_rate_at = self.t;
+    }
+
+    /// 平滑之后的总速度，角标用这个数，不用每 2 秒的原始合计。
+    pub(crate) fn smoothed_rate(&self) -> f32 {
+        self.task_rate_ema
+    }
+
     pub fn toggle_task_fold(&mut self, id: &str) {
         if let Some(index) = self.task_expanded.iter().position(|open| open == id) {
             self.task_expanded.remove(index);
@@ -1909,6 +1938,7 @@ impl App {
         self.weather_tick();
         self.task_tick();
         self.task_island_tick();
+        self.task_rate_tick();
         self.task_banner_tick();
         self.current_hour=env.hour();
         self.system_idle=env.idle_seconds;

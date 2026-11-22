@@ -227,11 +227,21 @@ impl App {
     }
 
     /// 收起态岛角标要显示的那一个任务：等你确认的优先，其次最近有动静的。
-    /// 速度取全岛合计（见 `IslandBadge`），没有在跑的、也没真实进度时给 `None`。
+    /// 速度取全岛合计（平滑后，见 `IslandBadge`），没有在跑的、也没真实进度时给 `None`。
     pub(crate) fn island_badge(&self) -> Option<IslandBadge> {
         let items = self.task.items();
         let task = pick_island_task(items)?;
-        badge_for(task, crate::task_scan::total_rate(items))
+        badge_for(task, self.island_rate())
+    }
+
+    /// 角标用的总速度：优先用平滑之后的值，还没有平滑值时退回本次扫描的合计。
+    fn island_rate(&self) -> f32 {
+        let smoothed = self.smoothed_rate();
+        if smoothed > 0.5 {
+            smoothed
+        } else {
+            crate::task_scan::total_rate(self.task.items())
+        }
     }
 
     /// 收起态角标要显示的文字：总速度 +（可选）当前任务的完成百分比。
@@ -244,7 +254,7 @@ impl App {
             return None;
         }
         let items = self.task.items();
-        let total = if with_speed { crate::task_scan::total_rate(items) } else { 0.0 };
+        let total = if with_speed { self.island_rate() } else { 0.0 };
         // 百分比仍按「岛上挑中的那个任务」算：它和用户看到的那个进度环是同一个会话。
         let progress = if with_progress { pick_island_task(items).and_then(live_progress) } else { None };
         let mut parts: Vec<String> = Vec::with_capacity(2);
