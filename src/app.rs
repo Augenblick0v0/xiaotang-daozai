@@ -1829,10 +1829,25 @@ impl App {
     /// 字幕条是否应当盖过全屏隐藏规则。主循环在 bin crate 里，不能读 crate 私有字段。
     pub fn caption_bar_visible(&self)->bool {
         let view=self.caption.view();
-        self.settings.caption_on_island
+        let visible=self.settings.caption_on_island
             && !self.open
-            && view.status==crate::caption::Status::Running
-            && view.lines.last().is_some_and(|line|!line.text.trim().is_empty())
+            && matches!(view.status,crate::caption::Status::Running|crate::caption::Status::Starting)
+            // 用 history 而不是 lines：lines 只在收到本场字幕帧后才有内容，重连或刚开一秒时为空，
+            // 岛上就什么都不显示（用户看到的就是「开了识别但岛上没有」）。
+            && view.history.last().is_some_and(|line|!line.text.trim().is_empty());
+        if let Ok(path)=std::env::var("DAOZAI_CAPTION_DEBUG") {
+            use std::sync::atomic::{AtomicU64,Ordering};
+            static LAST:AtomicU64=AtomicU64::new(0);
+            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d|d.as_millis() as u64).unwrap_or(0);
+            if now.saturating_sub(LAST.load(Ordering::Relaxed))>1000 {
+                LAST.store(now,Ordering::Relaxed);
+                if let Ok(mut f)=std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    use std::io::Write;
+                    let _=writeln!(f,"{{\"island\":true,\"visible\":{},\"on\":{},\"open\":{},\"status\":\"{:?}\",\"history\":{},\"last\":\"{}\"}}",visible,self.settings.caption_on_island,self.open,view.status,view.history.len(),view.history.last().map(|l|l.text.chars().take(12).collect::<String>()).unwrap_or_default());
+                }
+            }
+        }
+        visible
     }
 
     /// 收起药丸上有没有实时字幕可画：开关打开、没展开、侧车在跑，且最近一句有原文。
@@ -3131,7 +3146,7 @@ impl App {
             // 只显示原文会让「原文字语言 + 译文目标语言」这个承诺落空。
             // 岛上是「最新一句」的镜像：先跟最新原文，再补译文。
             // 不能为了等译文停在旧句上——展开页已经到下一句，药丸还挂在上一句就是脱节。
-            let last=view.lines.iter().rev().find(|line|!line.text.trim().is_empty());
+            let last=view.history.iter().rev().find(|line|!line.text.trim().is_empty());
             if let Some(line)=last {
                 let caption_alpha=1.0-smoothstep(0.0,0.35,p);
                 if caption_alpha>0.003 {
