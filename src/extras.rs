@@ -1329,6 +1329,7 @@ fn settings_page_icon(page:usize)->egui::ImageSource<'static>{
         QUOTA_PAGE=>("quota",include_bytes!("../assets/settings-icons/system/quota.svg")),
         TASK_PAGE=>("ai-tasks",include_bytes!("../assets/settings-icons/system/tasks.svg")),
         DOWNLOAD_PAGE=>("download",include_bytes!("../assets/settings-icons/system/download.svg")),
+        CAPTION_PAGE=>("caption",include_bytes!("../assets/settings-icons/system/caption.svg")),
         CALENDAR_PAGE=>("calendar",include_bytes!("../assets/settings-icons/system/calendar.svg")),
         _=>("weather",include_bytes!("../assets/settings-icons/system/weather.svg")),
     };
@@ -1339,7 +1340,7 @@ fn settings_page_icon(page:usize)->egui::ImageSource<'static>{
 #[cfg_attr(not(test),allow(dead_code))]
 pub(crate) fn settings_tab_module(tab:usize)->Option<usize>{
     use crate::app::*;
-    match tab {1=>Some(MUSIC_PAGE),2=>Some(FOCUS_PAGE),3=>Some(WATER_PAGE),4=>Some(TODO_PAGE),5=>Some(SHELF_PAGE),7=>Some(MAIL_PAGE),8=>Some(CALENDAR_PAGE),11=>Some(QUOTA_PAGE),12=>Some(WEATHER_PAGE),15=>Some(TASK_PAGE),16=>Some(DOWNLOAD_PAGE),_=>None}
+    match tab {1=>Some(MUSIC_PAGE),2=>Some(FOCUS_PAGE),3=>Some(WATER_PAGE),4=>Some(TODO_PAGE),5=>Some(SHELF_PAGE),7=>Some(MAIL_PAGE),8=>Some(CALENDAR_PAGE),11=>Some(QUOTA_PAGE),12=>Some(WEATHER_PAGE),15=>Some(TASK_PAGE),16=>Some(DOWNLOAD_PAGE),17=>Some(CAPTION_PAGE),_=>None}
 }
 
 pub(crate) fn settings_label(ui:&mut egui::Ui,text:&str){
@@ -1474,9 +1475,9 @@ pub(crate) const SETTINGS_TAB_APPEARANCE: usize = 13;
 pub(crate) const SETTINGS_TAB_POSITION: usize = 14;
 /// 侧栏：一项就是一页，不再有页内子标签。专注与健康（2、3）、待办与置物（4、5）各合成一页；关于固定左下角。
 /// 第四列是这一项之前的分组标题。
-const SETTINGS_GROUPS: [(&str,usize,usize,&str);15] = [
+const SETTINGS_GROUPS: [(&str,usize,usize,&str);16] = [
     ("通用",0,0,"岛仔"), ("外观",SETTINGS_TAB_APPEARANCE,SETTINGS_TAB_APPEARANCE,""), ("位置",SETTINGS_TAB_POSITION,SETTINGS_TAB_POSITION,""), ("页面管理",10,10,""),
-    ("音乐",1,1,"功能"), ("专注与健康",2,3,""), ("待办与置物",4,5,""), ("消息提醒",6,6,""), ("邮箱",7,7,""), ("日程",8,8,""), ("AI 额度",11,11,""), ("天气",12,12,""), ("AI 任务",15,15,""), ("下载",16,16,""),
+    ("音乐",1,1,"功能"), ("专注与健康",2,3,""), ("待办与置物",4,5,""), ("消息提醒",6,6,""), ("邮箱",7,7,""), ("日程",8,8,""), ("AI 额度",11,11,""), ("天气",12,12,""), ("AI 任务",15,15,""), ("下载",16,16,""), ("字幕",17,17,""),
     ("关于",9,9,""),
 ];
 /// 分页标题；合并页（3→2、5→4）显示合并后的名字。
@@ -1582,6 +1583,7 @@ impl App {
                         12=>egui::include_image!("../assets/settings-icons/system/weather.svg"),
                         15=>egui::include_image!("../assets/settings-icons/system/tasks.svg"),
                         16=>egui::include_image!("../assets/settings-icons/system/download.svg"),
+                        17=>egui::include_image!("../assets/settings-icons/system/caption.svg"),
                         7=>egui::include_image!("../assets/settings-icons/system/mail.svg"),
                         8=>egui::include_image!("../assets/settings-icons/system/calendar.svg"),
                         SETTINGS_TAB_APPEARANCE=>egui::include_image!("../assets/settings-icons/system/appearance.svg"),
@@ -1619,6 +1621,11 @@ impl App {
                         ui.add_space(4.0);
                         ui.add_enabled_ui(on,|ui|self.download_settings(ui));
                     }
+                    17=>{
+                        let on=self.settings_feature_header(ui,crate::app::CAPTION_PAGE,"本机声音转成实时字幕，可选翻译成目标语言",|_,_|{});
+                        ui.add_space(4.0);
+                        ui.add_enabled_ui(on,|ui|self.caption_settings(ui));
+                    }
                     11=>{
                         let on=self.settings_feature_header(ui,crate::app::QUOTA_PAGE,"每 3 分钟自动更新剩余额度",|_,_|{});
                         ui.add_space(4.0);
@@ -1643,7 +1650,7 @@ impl App {
                         });
                         settings_label(ui,"功能页面");
                         settings_card(ui,|ui|{
-                            let descriptions=["播放控制与同步歌词","番茄钟与休息计时","喝水与久坐提醒","临时收纳文件位置","任务清单与到期提醒","邮件摘要与验证码","Agent 剩余额度和账号切换","月历、邮件邀请与工作日程","当地天气与七日预报","AI 会话进度与等你确认","Ghost Downloader 最近下载"];
+                            let descriptions=page_descriptions();
                             ui.label(egui::RichText::new("拖动左侧手柄调整顺序；关闭的功能不在后台运行，不同步也不提醒，已有数据保留。").size(11.5).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
                             #[derive(Clone)]
                             struct PageDrag(usize);
@@ -1664,7 +1671,7 @@ impl App {
                                     // 每行右侧「设置 ›」直接跳到这个功能的设置页，开关仍在最右。
                                     let jump_w=58.0;
                                     ui.allocate_ui(egui::vec2((ui.available_width()-jump_w-ui.spacing().item_spacing.x).max(160.0),40.0),|ui|{
-                                        ui.add_enabled_ui(can_change,|ui|{setting_row(ui,PAGE_NAMES[page],descriptions[page],&mut visible);});
+                                        ui.add_enabled_ui(can_change,|ui|{setting_row(ui,PAGE_NAMES[page],descriptions.get(page).copied().unwrap_or(""),&mut visible);});
                                     });
                                     if ui.add_sized([jump_w,26.0],egui::Button::new(egui::RichText::new("设置 ›").size(12.0)).frame(false)).on_hover_text(format!("打开「{}」设置",PAGE_NAMES[page])).clicked(){jump=Some(crate::app::PAGE_SETTINGS_TABS[page]);}
                                 })).inner.response;
@@ -2437,4 +2444,11 @@ fn avatar_texture(ctx:&egui::Context,path:&std::path::Path)->Option<egui::Textur
     let texture=ctx.load_texture(format!("messenger-avatar-{}",path.display()),color,egui::TextureOptions::LINEAR);
     ctx.data_mut(|data|data.insert_temp(key,AvatarSlot{texture:Some(texture.clone())}));
     Some(texture)
+}
+
+
+
+/// 页面管理里每页的一句话说明：顺序与 `PAGE_NAMES` 一一对应。
+pub(crate) fn page_descriptions() -> &'static [&'static str] {
+    &["播放控制与同步歌词","番茄钟与休息计时","喝水与久坐提醒","临时收纳文件位置","任务清单与到期提醒","邮件摘要与验证码","Agent 剩余额度和账号切换","月历、邮件邀请与工作日程","当地天气与七日预报","AI 会话进度与等你确认","Ghost Downloader 最近下载","实时字幕原文与目标语言翻译"]
 }

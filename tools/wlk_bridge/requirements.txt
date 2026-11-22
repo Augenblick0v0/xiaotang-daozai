@@ -1,0 +1,11 @@
+# WhisperLiveKit streaming bridge — pinned to the version whose API this
+# sidecar was written against.
+whisperlivekit[translation]==0.2.28
+
+# Optional: Windows + NVIDIA GPU only.  Install these to let CTranslate2 use
+# CUDA (the loader adds site-packages/nvidia/*/bin to the DLL search path).
+# CPU-only machines can leave them out; --device auto then falls back to
+# cpu/int8.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+

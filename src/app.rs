@@ -39,14 +39,19 @@ pub const WEATHER_PAGE: usize = 8;
 pub const TASK_PAGE: usize = 9;
 /// 下载页：IDM / Free Download Manager / Ghost Downloader 最近下载的任务。
 pub const DOWNLOAD_PAGE: usize = 10;
+/// 实时字幕页：本机声音 → 实时字幕 + 译文。
+pub const CAPTION_PAGE: usize = 11;
 pub(crate) const WEATHER_H: f32 = 232.0;
 pub(crate) const TASK_H: f32 = 232.0;
 pub(crate) const DOWNLOAD_H: f32 = 232.0;
+pub(crate) const CAPTION_H: f32 = 232.0;
 pub(crate) const CALENDAR_H: f32 = 216.0;
 pub const BAR_W: f32 = 163.0; // 收起药丸宽
 pub const BAR_H: f32 = 30.0; // 收起药丸高
 pub(crate) const HUD_W: f32 = 260.0;
 pub(crate) const LYRIC_BAR_W: f32 = 300.0;
+/// 收起药丸上的字幕条宽度：比歌词条宽，容得下原文 + 译文一行。
+pub(crate) const CAPTION_BAR_W: f32 = 440.0;
 pub(crate) const HUD_TRACK_X: f32 = 48.0;
 pub(crate) const HUD_TRACK_W: f32 = 150.0;
 pub const BAR_W_MIN: f32 = 44.0; // 极简小条
@@ -93,8 +98,8 @@ fn pill_shadow(painter:&egui::Painter,rect:Rect,radius:f32,strength:f32){
         painter.rect_filled(r,radius+grow*0.8,Color32::from_black_alpha((255.0*a*strength) as u8));
     }
 }
-pub(crate) const PAGE_NAMES: [&str; 11] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "AI 任务", "下载"];
-pub(crate) const PAGE_SETTINGS_TABS: [usize; 11] = [1,2,3,5,4,7,11,8,12,15,16];
+pub(crate) const PAGE_NAMES: [&str; 12] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "AI 任务", "下载", "字幕"];
+pub(crate) const PAGE_SETTINGS_TABS: [usize; 12] = [1,2,3,5,4,7,11,8,12,15,16,17];
 
 // ---------- 动效参数 ----------
 /// 悬停意图缓冲：光标停留这么久才真正展开（期间药丸轻微胀大作为反馈），防误触。
@@ -770,7 +775,7 @@ pub struct App {
     page_dir: f32,
     page_t0: f64,
     slide: Spring,
-    dots: [Spring; 11],
+    dots: [Spring; 12],
     wheel_delta: f32,
     pub(crate) content_scroll: Option<(egui::Id, f32)>,
     wheel_at: f64,
@@ -929,6 +934,14 @@ pub struct App {
     pub(crate) download_confirm: Option<(String, f64)>,
     /// 被手动点掉的那条上岛卡片：同一轮下载里不再自动弹回来（收场后自动失效）。
     pub(crate) download_dismissed: Option<String>,
+    /// 实时字幕：侧车状态与最近一次结果。
+    pub(crate) caption: crate::caption::Captions,
+    /// 实时字幕当前的启动参数；变了就重启侧车。
+    pub(crate) caption_cfg: Option<crate::caption::StartConfig>,
+    /// 「安装识别环境」的后台进度。
+    pub(crate) caption_install: crate::caption_ui::Installer,
+    /// 开机自动开启字幕只做一次，之后尊重用户的手动开关。
+    caption_boot: bool,
 }
 
 impl App {
@@ -1068,6 +1081,10 @@ impl App {
         download: crate::download_scan::Watcher::new(),
         download_confirm: None,
         download_dismissed: None,
+        caption: crate::caption::Captions::new(),
+        caption_cfg: None,
+        caption_install: crate::caption_ui::Installer::new(),
+        caption_boot: false,
         }
     }
 
@@ -1754,7 +1771,17 @@ impl App {
         self.settings.island_lyrics && self.settings.visible_pages[0] && self.media.is_music() && self.media.playing
             && !self.browser_minimal_active
     }
-    pub(crate) fn compact_notices(&self)->bool {self.island_lyrics_active()&&!self.open&&!self.notice.as_ref().is_some_and(|a|a.meeting.is_some()||self.settings.notification_preview&&matches!(a.source,crate::extras::AlertSource::External(_)))}
+    /// 收起药丸上有没有实时字幕可画：开关打开、没展开、侧车在跑，且最近一句有原文。
+    fn island_caption_active(&self)->bool {
+        if self.side() {return false;}
+        if !self.settings.caption_on_island || self.open {return false;}
+        let view=self.caption.view();
+        view.status==crate::caption::Status::Running
+            && view.lines.last().is_some_and(|line|!line.text.trim().is_empty())
+    }
+    /// 药丸上的滚动内容：歌词优先，歌词不在时用实时字幕。
+    fn island_ticker_active(&self)->bool {self.island_lyrics_active()||self.island_caption_active()}
+    pub(crate) fn compact_notices(&self)->bool {self.island_ticker_active()&&!self.open&&!self.notice.as_ref().is_some_and(|a|a.meeting.is_some()||self.settings.notification_preview&&matches!(a.source,crate::extras::AlertSource::External(_)))}
 
     /// 换句、分段和展开高亮共用时间调整；正数延后，负数提前。
     pub(crate) fn lyric_position(&self)->f32 {(self.media.position-self.settings.lyric_delay_ms as f64/1000.0)as f32}
@@ -1831,6 +1858,9 @@ impl App {
     }
     fn lyric_focus_space(&self)->f32 {if self.pomo.running{crate::focus_bar::LYRIC_WIDTH+10.0}else{0.0}}
     fn lyric_bar_width(&self)->f32 {LYRIC_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()}
+    fn caption_bar_width(&self)->f32 {CAPTION_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()}
+    /// 当前滚动条用哪套宽度：歌词占位优先，其次字幕。
+    fn island_ticker_width(&self)->f32 {if self.island_lyrics_active(){self.lyric_bar_width()}else{self.caption_bar_width()}}
     fn notice_size(&self,a:&Alert)->(f32,f32) {
         let (width,height)=if a.meeting.is_some(){(360.0,136.0)}
             else if a.download.is_some(){(334.0,56.0)}
@@ -1853,8 +1883,8 @@ impl App {
             // 左右停靠：竖向胶囊（通知仍是贴边滑出的横向卡片，见上）。
             return self.side_base_size(self.effective_minimal()&&self.t>=self.notification_bell_until);
         }
-        if self.island_lyrics_active() {
-            (self.lyric_bar_width(),BAR_H)
+        if self.island_ticker_active() {
+            (self.island_ticker_width(),BAR_H)
         } else if self.effective_minimal()&&self.t>=self.notification_bell_until {
             (BAR_W_MIN, BAR_H_MIN)
         } else {
@@ -1880,7 +1910,7 @@ impl App {
     }
 
     pub(crate) fn expanded_height(&self)->f32 {
-        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==TASK_PAGE {TASK_H}else if self.page==DOWNLOAD_PAGE {DOWNLOAD_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
+        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==TASK_PAGE {TASK_H}else if self.page==DOWNLOAD_PAGE {DOWNLOAD_H}else if self.page==CAPTION_PAGE {CAPTION_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
     }
 
     // ---------------------------------------------------------------
@@ -1902,6 +1932,7 @@ impl App {
         self.task_island_tick();
         self.download_tick();
         self.download_island_tick();
+        self.caption_tick();
         self.current_hour=env.hour();
         self.system_idle=env.idle_seconds;
         self.dt = dt;
@@ -1953,7 +1984,7 @@ impl App {
         if !self.settings.show_clock {layout.hide_clock();}
         if self.pet_enabled() {
             if let Some(a)=self.notice.as_ref().filter(|_|!self.compact_notices()&&!self.open){layout.x[bar::PET]=Some(22.0-(self.notice_size(a).0+self.pet_space())/2.0);}
-            else if self.island_lyrics_active() {layout.x[bar::PET]=Some(60.0-self.lyric_bar_width()/2.0);}
+            else if self.island_ticker_active() {layout.x[bar::PET]=Some(60.0-self.island_ticker_width()/2.0);}
         }
         self.resident.step(layout,dt,ctx.style().animation_time>0.0&&bar::animations_enabled());
         if self.opts.fetch_lyrics {
@@ -2096,7 +2127,7 @@ impl App {
         let notice_shape=notice_rect.map(|r|Rect::from_min_max(Pos2::new(r.left()-36.0,r.top()),r.max));
         let body=messenger_rect.filter(|_|outside_badge.is_none()).map_or(panel,|badge|panel.union(badge));
         let body=notice_shape.map_or(body,|notice|body.union(notice));
-        let minimal_strip = self.effective_minimal() && !self.island_lyrics_active() && self.notice.is_none() && self.t>=self.notification_bell_until;
+        let minimal_strip = self.effective_minimal() && !self.island_ticker_active() && self.notice.is_none() && self.t>=self.notification_bell_until;
         let minimal_pill = minimal_strip && pc < 0.02;
         let flare = if minimal_pill || pill { 0.0 } else { lerp(5.0, FLARE, pc) };
         let k = (w / PW).clamp(0.3, 1.1);
@@ -2154,7 +2185,7 @@ impl App {
         self.cursor_local = env.cursor.map(|p| base.to_local(p));
 
         let banner=!self.compact_notices()&&self.notice.is_some()&&!self.open;
-        let restoring_lyrics=!self.open&&self.notice.is_none()&&self.island_lyrics_active()&&self.hud_notice.as_ref().is_some_and(|a|a.meeting.is_some()||a.source!=crate::extras::AlertSource::Internal);
+        let restoring_lyrics=!self.open&&self.notice.is_none()&&self.island_ticker_active()&&self.hud_notice.as_ref().is_some_and(|a|a.meeting.is_some()||a.source!=crate::extras::AlertSource::Internal);
         let fading_hud=!self.compact_notices()&&!self.open&&self.hud_notice.as_ref().is_some_and(|a|a.is_hud())&&(banner||self.hud_alpha>0.003);
         if fading_hud {
             let from=self.resident.target.width;let to=HUD_W+self.pet_space();
@@ -2219,7 +2250,7 @@ impl App {
         if pet_alpha>0.004 && !minimal_pill {
             let y=(h.min(self.base_size().1)-BAR_H).max(0.0)/2.0;
             // 吉祥物跟随皮肤换色：浅色底上变成深色版本，保持清晰。
-            let fit=if self.island_lyrics_active()||self.notice.is_some(){1.0}else{((WIN_W-32.0)/self.resident.target.width).min(1.0)};
+            let fit=if self.island_ticker_active()||self.notice.is_some(){1.0}else{((WIN_W-32.0)/self.resident.target.width).min(1.0)};
             self.pet.draw(&base.scaled(cx-origin.x,15.0,fit).shifted(0.0,y).faded(pet_alpha),cx-origin.x+self.resident.position(bar::PET),self.t,self.skin_palette());
         }
         let previous_scroll=self.content_scroll.take();
@@ -3013,6 +3044,62 @@ impl App {
         if lyric_alpha>=0.997 {return;}
         let header=base.faded(1.0-lyric_alpha);
         let base=&header;
+        // 实时字幕条：没有歌词时占用药丸，替代时钟区。只画最近一行；
+        // 最后一行还在增长（done=false）也照样显示，用灰色区别于定稿句。
+        if !self.island_lyrics_active() && self.island_caption_active() {
+            let view=self.caption.view();
+            // 药丸优先显示「最近一条已译好的」：最新一句常常还在等译文，
+            // 只显示原文会让「原文字语言 + 译文目标语言」这个承诺落空。
+            let last=view.lines.iter().rev().find(|line|!line.text.trim().is_empty()&&!line.translation.trim().is_empty())
+                .or_else(||view.lines.iter().rev().find(|line|!line.text.trim().is_empty()));
+            if let Some(line)=last {
+                let caption_alpha=1.0-smoothstep(0.0,0.35,p);
+                if caption_alpha>0.003 {
+                    let c=base.faded(caption_alpha);
+                    let content_width=self.caption_bar_width()-self.lyric_focus_space();
+                    let width=self.w.pos.max(content_width);
+                    let left=local_cx-width/2.0;
+                    let center_y=BAR_H/2.0;
+                    let base_y=center_y+4.5;
+                    let right=left+content_width-12.0;
+                    let mut x=left+12.0;
+                    let tag=if view.lang.trim().is_empty(){String::new()}else{crate::caption_ui::language_tag(&view.lang)};
+                    let tag=if view.translate&&!view.target.trim().is_empty()&&!tag.is_empty()
+                        {format!("[{tag}>{}]",crate::caption_ui::language_tag(&view.target))}else{format!("[{tag}]")};
+                    if tag=="[]" {
+                        c.circle(x+3.0,center_y,2.2,theme::CYAN);
+                        x+=12.0;
+                    } else {
+                        x+=c.text(x,base_y,&tag,10.0,W::Semibold,theme::CYAN,H::Left)+7.0;
+                    }
+                    // 吉祥物坐在药丸左侧（PET 中心距左沿 60），字幕从它右边起排，别糊在脸上。
+                    if self.pet_enabled() {x=x.max(left+90.0);}
+                    let fsize=12.0;
+                    let ink=if line.done {theme::WHITE}else{theme::GRAY};
+                    let avail=(right-x).max(0.0);
+                    let original=line.text.trim();
+                    if line.translation.trim().is_empty() {
+                        let text=c.fit(original,fsize,W::Semibold,avail);
+                        c.text(x,base_y,&text,fsize,W::Semibold,ink,H::Left);
+                    } else {
+                        // 译文最多占 45%：空间不够时原文和译文都做省略号截断。
+                        let sep="  ·  ";
+                        let sep_w=c.text_w(sep,fsize,W::Regular);
+                        let trans=c.fit(line.translation.trim(),fsize,W::Regular,(avail*0.45).max(0.0));
+                        let trans_w=c.text_w(&trans,fsize,W::Regular);
+                        let text=c.fit(original,fsize,W::Semibold,(avail-sep_w-trans_w).max(0.0));
+                        x+=c.text(x,base_y,&text,fsize,W::Semibold,ink,H::Left);
+                        x+=c.text(x,base_y,sep,fsize,W::Regular,theme::DIM,H::Left);
+                        c.text(x,base_y,&trans,fsize,W::Regular,theme::CYAN,H::Left);
+                    }
+                    if self.pomo.running {
+                        let alpha=smoothstep(0.88,1.0,(width-content_width)/self.lyric_focus_space());
+                        crate::focus_bar::draw(&c.faded(alpha),left+width-14.0-crate::focus_bar::LYRIC_WIDTH/2.0,center_y,self.t,&self.pomo,self.phase_secs(self.pomo.phase),true);
+                    }
+                    return;
+                }
+            }
+        }
         let clock = self.settings.clock_text(&env.clock);
         let show_battery=self.settings.show_battery && env.battery.is_some();
 
@@ -3053,10 +3140,10 @@ impl App {
         // 谁先来：正在跑的下载（字节/秒）压过 AI 任务（token/秒），两者共用这一处版式，
         // 单位由 `rate_unit` 决定。只在收起、非极简、对应设置打开时画；
         // 展开后任务页/下载页本身有更完整的呈现。
-        // 歌词占着药丸（它比常驻内容宽得多）时不画：那会儿药丸的左边缘是封面和歌词，
-        // 角标压上去只会糊成一片，等歌词退场自然就回来了。
+        // 歌词/字幕占着药丸（它们比常驻内容宽得多）时不画：那会儿药丸里是封面和文字，
+        // 角标压上去只会糊成一片，等滚动条退场自然就回来了。
         let badge_quiet = lyric_alpha <= 0.003
-            && !self.island_lyrics_active()
+            && !self.island_ticker_active()
             && self.notice.is_none()
             && !self.hud_notice.as_ref().is_some_and(|a| a.is_hud());
         if self.island_badge_reserve() > 0.0 && badge_quiet {
@@ -3258,7 +3345,7 @@ impl App {
             8 if self.weather.solar_open => ("日出", "日落", theme::YELLOW),
             8 => ("当地", "天气", theme::CYAN),
             TASK_PAGE => ("AI", "任务", theme::SOFT_GREEN),
-            10 => return,
+            10 | CAPTION_PAGE => return,
             _ => ("岛仔", "设置", theme::WHITE),
         };
         let wa = c.text(15.0, base, a, size::TITLE, W::Bold, theme::WHITE, H::Left);
@@ -3270,7 +3357,7 @@ impl App {
     fn nav(&mut self, c: &Card) {
         let pages: Vec<_>=self.settings.page_order.iter().copied().filter(|page|self.settings.visible_pages[*page]).collect();
         if pages.len()<2 { return; }
-        let arrow_y=if self.page==6||self.page==8||self.page==TASK_PAGE||self.page==DOWNLOAD_PAGE{88.0}else{68.0};
+        let arrow_y=if self.page==6||self.page==8||self.page==TASK_PAGE||self.page==DOWNLOAD_PAGE||self.page==CAPTION_PAGE{88.0}else{68.0};
         let l = c.hit(8.0, arrow_y-13.0, 26.0, 26.0, "nav-l");
         let r = c.hit(385.0, arrow_y-13.0, 26.0, 26.0, "nav-r");
         let (lh, lp) = c.hover_t(&l);
@@ -3319,6 +3406,7 @@ impl App {
             8 => self.page_weather(c,env,cmds),
             TASK_PAGE => self.page_task(c, env, cmds),
             DOWNLOAD_PAGE => self.page_download(c, env, cmds),
+            CAPTION_PAGE => self.page_caption(c, env, cmds),
             CALENDAR_PAGE => self.page_calendar(c,env),
             _ => self.page_settings(c),
         }
@@ -3705,3 +3793,8 @@ impl App {
         }
     }
 }
+
+
+
+
+

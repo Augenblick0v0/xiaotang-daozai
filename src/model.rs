@@ -216,8 +216,8 @@ pub struct Settings {
     pub browser_minimal: bool,
     pub avoid_browsers: bool,
     pub avoid_apps: Vec<(String,String)>,
-    pub visible_pages: [bool; 11],
-    pub page_order: [usize; 11],
+    pub visible_pages: [bool; 12],
+    pub page_order: [usize; 12],
     pub show_clock: bool,
     pub show_battery: bool,
     pub show_weather: bool,
@@ -307,11 +307,33 @@ pub struct Settings {
     pub download_island_speed: bool,
     /// 删下载文件前先问一句；确认后送回收站，不直接抹掉。
     pub download_confirm_delete: bool,
+    /// 实时字幕：总开关。
+    pub caption_enabled: bool,
+    /// 实时字幕：岛仔启动后自动开始听。
+    pub caption_autostart: bool,
+    /// 实时字幕音源：0 = 系统声音，1 = 麦克风。
+    pub caption_source: u8,
+    /// 实时字幕：是否同时显示译文。
+    pub caption_translate: bool,
+    /// 实时字幕：译文目标语言（NLLB 短码，如 zh / en）。
+    pub caption_target_lang: String,
+    /// 实时字幕：显示还在识别中的半句。
+    pub caption_show_partial: bool,
+    /// 岛收起时在角标位置显示最近一句字幕。
+    pub caption_on_island: bool,
+    /// 实时字幕：自定义 Python 解释器路径，空 = 用装好的环境。
+    pub caption_python: String,
+    /// 实时字幕：识别模型（base / small）。
+    pub caption_model: String,
+    /// 实时字幕算力：0 = 自动，1 = 只用 CPU。
+    pub caption_device: u8,
+    /// 实时字幕：解码束宽（1 = 最快）。
+    pub caption_beam: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 11], page_order: [0,1,2,3,4,5,6,7,8,9,10], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, qq_avatar:true, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), task_sources: [true;3], task_keep_minutes: 30, task_hide_project: false, task_island_speed: true, task_island_progress: true, download_sources: [false,false,true], download_keep_minutes: 1440, download_island: true, download_island_speed: true, download_confirm_delete: true }
+        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 12], page_order: [0,1,2,3,4,5,6,7,8,9,10,11], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, qq_avatar:true, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), task_sources: [true;3], task_keep_minutes: 30, task_hide_project: false, task_island_speed: true, task_island_progress: true, download_sources: [false,false,true], download_keep_minutes: 1440, download_island: true, download_island_speed: true, download_confirm_delete: true, caption_enabled: false, caption_autostart: false, caption_source: 0, caption_translate: false, caption_target_lang: "zh".into(), caption_show_partial: true, caption_on_island: true, caption_python: String::new(), caption_model: "base".into(), caption_device: 0, caption_beam: 1 }
     }
 }
 
@@ -373,23 +395,30 @@ impl Settings {
                 }
                 "page_order" => {
                     if let Ok(order)=v.split(',').map(str::parse::<usize>).collect::<Result<Vec<_>,_>>() {
-                        if order.len()==11 && (0..11).all(|page|order.contains(&page)) {
+                        if order.len()==12 && (0..12).all(|page|order.contains(&page)) {
                             s.page_order.copy_from_slice(&order);
+                        } else if order.len()==11 && (0..11).all(|page|order.contains(&page)) {
+                            // 旧配置里没有实时字幕页：接在最后，其余顺序保持不变。
+                            s.page_order[..11].copy_from_slice(&order);
+                            s.page_order[11]=11;
                         } else if order.len()==10 && (0..10).all(|page|order.contains(&page)) {
                             // 旧配置里没有下载页：接在最后，其余顺序保持不变。
                             s.page_order[..10].copy_from_slice(&order);
                             s.page_order[10]=10;
+                            s.page_order[11]=11;
                         } else if order.len()==9 && (0..9).all(|page|order.contains(&page)) {
                             // 旧配置里没有 AI 任务页：接在最后，其余顺序保持不变。
                             s.page_order[..9].copy_from_slice(&order);
                             s.page_order[9]=9;
                             s.page_order[10]=10;
+                            s.page_order[11]=11;
                         } else if order.len()==8 && (0..8).all(|page|order.contains(&page)) {
                             // 旧配置里没有天气页：接在最后，其余顺序保持不变。
                             s.page_order[..8].copy_from_slice(&order);
                             s.page_order[8]=8;
                             s.page_order[9]=9;
                             s.page_order[10]=10;
+                            s.page_order[11]=11;
                         }
                     }
                 }
@@ -399,7 +428,7 @@ impl Settings {
                 "show_battery" => s.show_battery = v != "0",
                 "show_clock" => s.show_clock = v != "0",
                 "show_weather" => s.show_weather = v != "0",
-                "visible_pages" if (6..=11).contains(&v.len()) && v.bytes().all(|b| b==b'0' || b==b'1') => {
+                "visible_pages" if (6..=12).contains(&v.len()) && v.bytes().all(|b| b==b'0' || b==b'1') => {
                     for (enabled,value) in s.visible_pages.iter_mut().zip(v.bytes()) { *enabled=value==b'1'; }
                     for enabled in &mut s.visible_pages[v.len()..]{*enabled=v.bytes().any(|b|b==b'1');}
                 }
@@ -426,6 +455,21 @@ impl Settings {
                 "download_island" => s.download_island = v=="1",
                 "download_island_speed" => s.download_island_speed = v=="1",
                 "download_confirm_delete" => s.download_confirm_delete = v!="0",
+                "caption_enabled" => s.caption_enabled = v=="1",
+                "caption_autostart" => s.caption_autostart = v=="1",
+                "caption_source" => s.caption_source = v.parse::<u8>().ok().filter(|v|*v<=1).unwrap_or(0),
+                "caption_translate" => s.caption_translate = v=="1",
+                "caption_target_lang" => {
+                    if matches!(v.as_str(),"zh"|"en"|"ja"|"ko") { s.caption_target_lang = v.to_string(); }
+                }
+                "caption_show_partial" => s.caption_show_partial = v!="0",
+                "caption_on_island" => s.caption_on_island = v!="0",
+                "caption_python" => s.caption_python = v.to_string(),
+                "caption_model" => {
+                    if matches!(v.as_str(),"base"|"small") { s.caption_model = v.to_string(); }
+                }
+                "caption_device" => s.caption_device = v.parse::<u8>().ok().filter(|v|*v<=1).unwrap_or(0),
+                "caption_beam" => s.caption_beam = v.parse::<u8>().ok().filter(|v|(1..=5).contains(v)).unwrap_or(1),
                 "system_hud" => s.system_hud = v != "0",
                 "bluetooth_notifications" => s.bluetooth_notifications = v != "0",
                 "notifications" => s.notifications = v != "0",
@@ -521,6 +565,17 @@ impl Settings {
                 ("download_island".into(), (self.download_island as u8).to_string()),
                 ("download_island_speed".into(), (self.download_island_speed as u8).to_string()),
                 ("download_confirm_delete".into(), (self.download_confirm_delete as u8).to_string()),
+                ("caption_enabled".into(), (self.caption_enabled as u8).to_string()),
+                ("caption_autostart".into(), (self.caption_autostart as u8).to_string()),
+                ("caption_source".into(), self.caption_source.to_string()),
+                ("caption_translate".into(), (self.caption_translate as u8).to_string()),
+                ("caption_target_lang".into(), self.caption_target_lang.clone()),
+                ("caption_show_partial".into(), (self.caption_show_partial as u8).to_string()),
+                ("caption_on_island".into(), (self.caption_on_island as u8).to_string()),
+                ("caption_python".into(), self.caption_python.clone()),
+                ("caption_model".into(), self.caption_model.clone()),
+                ("caption_device".into(), self.caption_device.to_string()),
+                ("caption_beam".into(), self.caption_beam.to_string()),
                 ("system_hud".into(), (self.system_hud as u8).to_string()),
                 ("bluetooth_notifications".into(), (self.bluetooth_notifications as u8).to_string()),
                 ("notifications".into(), (self.notifications as u8).to_string()),
