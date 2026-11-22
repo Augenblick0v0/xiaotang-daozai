@@ -265,6 +265,10 @@ impl ToastAccounts {
     pub fn target(&mut self,client:Messenger,id:u32,created:i64)->Option<Target>{
         self.entries.iter_mut().find(|entry|entry.client==client)?.history.target(id,created,client.adapter().native.ready)
     }
+    /// 绑定失败的原因，只用于诊断日志。
+    pub fn diagnose(&self,client:Messenger,created:i64)->String{
+        self.entries.iter().find(|entry|entry.client==client).map_or_else(||"没有在采样这个客户端".to_string(),|entry|entry.history.diagnose(created))
+    }
     pub fn retain(&mut self,exists:impl Fn(Messenger,u32,i64)->bool){
         for entry in &mut self.entries{let client=entry.client;entry.history.retain(|id,created|exists(client,id,created));}
     }
@@ -711,6 +715,84 @@ mod tests {
             assert!(monitor.exited_with(&[unread],|_|None).is_empty(),"无法确认客户端状态时保留提醒");
             assert_eq!(monitor.exited_with(&[unread],|_|Some(Vec::new())),[unread]);
         }
+    }
+    #[test]
+    #[ignore]
+    fn live_qq_binding_in_the_real_loop(){
+        use crate::app::Messenger;
+        let mut accounts=ToastAccounts::default();
+        let now=||{
+            let time=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+            i64::try_from(time.as_nanos()/100+116444736000000000).unwrap()
+        };
+        accounts.sample();
+        for round in 0..6{
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            accounts.sample();
+            let created=now()-(round as i64)*10_000_000;
+            let bound=accounts.target(Messenger::Qq,100,created);
+            println!("round {round} created={created} bound={:?} 原因={}",bound.map(|t|t.unread.pid),accounts.diagnose(Messenger::Qq,created));
+        }
+    }
+    #[test]
+    #[ignore]
+    fn live_qq_accounts_sampling_stability(){
+        use crate::app::Messenger;
+        let adapter=Messenger::Qq.adapter();
+        let paths=(adapter.native.paths)();
+        let discover=(adapter.native.accounts).unwrap();
+        for i in 0..40{
+            let started=std::time::Instant::now();
+            let accounts=discover(&paths);
+            let elapsed=started.elapsed();
+            match accounts{
+                None=>println!("{i:02} accounts=None 用时 {:?}",elapsed),
+                Some(list)=>for target in &list{println!("{i:02} pid={} window=0x{:X} started={} 用时 {:?}",target.unread.pid,target.unread.window,target.started,elapsed)},
+            }
+            std::thread::sleep(std::time::Duration::from_millis(700));
+        }
+    }
+    #[test]
+    #[ignore]
+    fn live_qq_slow_round_keeps_the_account_bindable(){
+        use crate::app::Messenger;
+        let now=||{
+            let time=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+            i64::try_from(time.as_nanos()/100+116444736000000000).unwrap()
+        };
+        // 旧行为复现：通知线程一轮要 3.4 秒（读通知列表 + 读正文 + 查通知库），采样跟着变慢，
+        // 稳定账号永远判不出来——这正是「每条 QQ 消息都提示账号未确认」的根因。
+        let mut slow=ToastAccounts::default();
+        slow.sample();
+        std::thread::sleep(std::time::Duration::from_millis(3400));
+        slow.sample();
+        let created=now();
+        let slow_bound=slow.target(Messenger::Qq,200,created);
+        println!("慢采样 bound={:?} 原因={}",slow_bound.map(|t|t.unread.pid),slow.diagnose(Messenger::Qq,created));
+        assert!(slow_bound.is_none(),"慢采样居然绑上了，说明复现前提不成立");
+        // 现在：采样在独立线程里每 400 毫秒一次，主循环再慢也不影响稳定判定。
+        let fast=std::sync::Arc::new(std::sync::Mutex::new(ToastAccounts::default()));
+        let alive=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker={
+            let fast=fast.clone();
+            let alive=alive.clone();
+            std::thread::Builder::new().name("sampler-test".into()).spawn(move||{
+                while alive.load(std::sync::atomic::Ordering::Relaxed){
+                    fast.lock().unwrap().sample();
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            }).unwrap()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(3400));
+        let created=now();
+        let (fast_bound,reason)={
+            let mut guard=fast.lock().unwrap();
+            (guard.target(Messenger::Qq,201,created),guard.diagnose(Messenger::Qq,created))
+        };
+        println!("后台采样 bound={:?} 原因={}",fast_bound.map(|t|t.unread.pid),reason);
+        alive.store(false,std::sync::atomic::Ordering::Relaxed);
+        worker.join().ok();
+        assert!(fast_bound.is_some(),"后台采样应该能绑上账号");
     }
     #[test]
     fn messenger_reminders_survive_hidden_or_destroyed_windows(){unsafe{

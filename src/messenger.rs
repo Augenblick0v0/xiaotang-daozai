@@ -148,6 +148,10 @@ const STABLE_SAMPLE_GAP:i64 = 30_000_000;
 /// 否则「通知刚到时最近一次采样还是几百毫秒之前」会被判成账号不明。
 const TOAST_LAG:i64 = 20_000_000;
 
+/// 两个采样是否还是同一个账号：pid 与进程启动时间都要一致（进程重启算换了账号），
+/// 托盘宿主窗口句柄不算——QQ 会重建它，句柄变了账号没变。
+fn same_account(a:&Target,b:&Target)->bool{a.unread.pid==b.unread.pid&&a.started==b.started}
+
 pub(crate) struct AccountHistory {
     client:Messenger,
     previous:Option<(i64,Option<Vec<Target>>)>,
@@ -162,7 +166,7 @@ impl AccountHistory {
         // 连续单账号区间可覆盖延迟到达的通知，多开、采样失败或长时间暂停后重新计时。
         self.single_since=match(self.current.as_ref(),accounts.as_ref()){
             (Some((last,Some(previous))),Some(current)) if at>*last && at.checked_sub(*last).is_some_and(|gap|gap<=30_000_000)=>{
-                match(previous.as_slice(),current.as_slice()){([a],[b]) if a==b=>Some(self.single_since.unwrap_or(*last)),_=>None}
+                match(previous.as_slice(),current.as_slice()){([a],[b]) if same_account(a,b)=>Some(self.single_since.unwrap_or(*last)),_=>None}
             },
             _=>None,
         };
@@ -171,7 +175,7 @@ impl AccountHistory {
     pub(crate) fn target(&mut self,id:u32,created:i64,ready:impl FnOnce(Target)->bool)->Option<Target>{
         // 原地更新通知时可以降为未识别，但不能改绑到另一个账号。
         if let Some(&(at,target))=self.targets.get(&id){if at==created{
-            let target=target.filter(|target|self.stable_account().is_some_and(|(_,_,current)|current==*target)).filter(|target|ready(*target));
+            let target=target.filter(|target|self.stable_account().is_some_and(|(_,_,current)|same_account(&current,target))).filter(|target|ready(*target));
             self.targets.insert(id,(created,target));return target;
         }}
         let target=(||{
@@ -187,7 +191,24 @@ impl AccountHistory {
         let (from,Some(previous))=self.previous.as_ref()? else{return None;};
         let (to,Some(current))=self.current.as_ref()? else{return None;};
         if to<=from||to.checked_sub(*from)?>STABLE_SAMPLE_GAP{return None;}
-        match(previous.as_slice(),current.as_slice()){([a],[b]) if a==b=>Some((self.single_since?,*to,*a)),_=>None}
+        // 只比「账号」本身：QQ 重建托盘宿主窗口时窗口句柄会变，按整个 Target 相等来比会把
+        // 同一次「稳定单账号」判成换了账号，结果每条通知都成了「账号未确认」。
+        match(previous.as_slice(),current.as_slice()){([a],[b]) if same_account(a,b)=>Some((self.single_since?,*to,*b)),_=>None}
+    }
+    /// 绑不上时给日志一句人话：下次看日志就能分清是采样没稳定、还是时间对不上。
+    pub(crate) fn diagnose(&self,created:i64)->String{
+        let gap=self.current.as_ref().zip(self.previous.as_ref()).map(|((to,_),(from,_))|(to-from)/10_000);
+        let since=self.single_since.map(|since|(created-since)/10_000);
+        let head=match(self.previous.as_ref(),self.current.as_ref()){
+            (Some((_,Some(previous))),(Some((_,Some(current)))))=>format!("上次采样 {:?} 条、本次 {:?} 条",previous.len(),current.len()),
+            (Some((_,None)),_)=>return "上一次采样失败（托盘图标数或窗口归属有歧义）".into(),
+            (_,Some((_,None)))=>return "本次采样失败（托盘图标数或窗口归属有歧义）".into(),
+            _=>return "采样还没开始".into(),
+        };
+        let Some((from,to,_))=self.stable_account() else{return format!("{head}，间隔 {:?} 毫秒还不够稳定",gap);};
+        if created<=from{return format!("通知创建时间早于单账号稳定起点 {:?} 毫秒",since);}
+        if created>to+TOAST_LAG{return format!("通知创建时间超出投递宽限 {:?} 毫秒",self.current.as_ref().map(|(to,_)|(created-to)/10_000));}
+        let _=since;format!("{head}，但账号就绪检查未通过")
     }
     pub(crate) fn retain(&mut self,exists:impl Fn(u32,i64)->bool){self.targets.retain(|id,(created,_)|exists(*id,*created));}
 }
@@ -210,6 +231,29 @@ fn qq_icon(c:&Card,x:f32,y:f32){
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bind_target(pid:u32,window:isize)->Target{
+        Target{unread:crate::app::Unread{source:crate::app::Messenger::Qq,pid,window},started:u64::from(pid)}
+    }
+    #[test]
+    fn tray_host_window_churn_keeps_a_single_account_stable(){
+        let mut history=AccountHistory::new(crate::app::Messenger::Qq);
+        history.observe(10_000_000,Some(vec![bind_target(2780,0x30D58)]));
+        history.observe(20_000_000,Some(vec![bind_target(2780,0x3C104)]));
+        // QQ 重建了托盘宿主窗口：账号没变，通知仍应绑到这个账号，并且用当前句柄。
+        assert_eq!(history.target(1,15_000_000,|_|true),Some(bind_target(2780,0x3C104)));
+    }
+    #[test]
+    fn binding_failures_say_which_step_failed(){
+        let a=bind_target(2780,0x30D58);
+        let mut history=AccountHistory::new(crate::app::Messenger::Qq);
+        assert_eq!(history.diagnose(15_000_000),"采样还没开始");
+        history.observe(10_000_000,Some(vec![a]));
+        history.observe(20_000_000,Some(vec![a]));
+        assert!(history.diagnose(5_000_000).starts_with("通知创建时间早于单账号稳定起点"),"{}",history.diagnose(5_000_000));
+        assert!(history.diagnose(41_000_000).starts_with("通知创建时间超出投递宽限"),"{}",history.diagnose(41_000_000));
+        assert!(history.diagnose(15_000_000).ends_with("但账号就绪检查未通过"),"{}",history.diagnose(15_000_000));
+    }
     #[test]
     fn qq_logo_has_no_pale_fringe_around_the_black_head(){
         let image=image::load_from_memory(include_bytes!("../assets/qq-client.png")).unwrap().into_rgba8();

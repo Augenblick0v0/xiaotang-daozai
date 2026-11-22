@@ -671,6 +671,8 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
     let request = listener.RequestAccessAsync()?;
     let (tx, rx) = mpsc::sync_channel(32);
     let (stop, stopped)=mpsc::channel();
+    let accounts=std::sync::Arc::new(std::sync::Mutex::new(crate::messenger::ToastAccounts::default()));
+    let sampler=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let taskbar_mask=std::sync::Arc::new(std::sync::atomic::AtomicU8::new(mask));let worker_mask=taskbar_mask.clone();
     std::thread::Builder::new().name("daozai-notifications".into()).spawn(move || {
         let send=|event|{
@@ -692,8 +694,19 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
             let channels=crate::messenger::Messenger::ALL.into_iter().filter(|client|client.adapter().capture==crate::messenger::Capture::SystemToast)
                 .filter(|client|filter.allows(client.adapter().notification_id)).map(channel_status).collect::<Vec<_>>().join("\n");
             let mut baseline=baseline;
-            let mut accounts=crate::messenger::ToastAccounts::default();accounts.sample();
             let mut last_status=String::new();
+            // 采样节奏必须快于判定窗口：主循环一轮要读通知列表、正文和 QQ payload，
+            // 慢的时候能到三四秒，跟着主循环采样会把「稳定单账号」一直判成不稳定。
+            {
+                let accounts=accounts.clone();
+                let sampler=sampler.clone();
+                std::thread::Builder::new().name("daozai-account-sampler".into()).spawn(move||{
+                    while sampler.load(std::sync::atomic::Ordering::Relaxed){
+                        accounts.lock().unwrap_or_else(|poison|poison.into_inner()).sample();
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                    }
+                }).ok();
+            }
             loop {
                 if stopped.try_recv()!=Err(mpsc::TryRecvError::Empty){return Ok(());}
                 let (items,count)=match listener.GetAccessStatus().and_then(|access|{
@@ -710,7 +723,7 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
                         continue;
                     }
                 };
-                accounts.sample();
+                accounts.lock().unwrap_or_else(|poison|poison.into_inner()).sample();
                 let mut current=HashMap::new();
                 let mut complete=true;
                 let mut messages=Vec::new();
@@ -730,11 +743,16 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
                     let (version,body)=baseline.observe(number,created,client,tracked,body);
                     current.insert(number,version);
                     if let Some(body)=body{
-                        let target=client.filter(|client|client.adapter().capture==crate::messenger::Capture::SystemToast).map(|client|(client,accounts.target(client,number,created)))
-                            .and_then(|(client,target)|{
-                                if target.is_none(){crate::messenger::windows::trace(format!("通知 {id}·创建 {created} 未能绑定 {} 账号",client.name()));}
-                                target
-                            });
+                        let target=if let Some(client)=client.filter(|client|client.adapter().capture==crate::messenger::Capture::SystemToast){
+                            let mut accounts=accounts.lock().unwrap_or_else(|poison|poison.into_inner());
+                            let target=accounts.target(client,number,created);
+                            if target.is_none(){
+                                let reason=accounts.diagnose(client,created);
+                                drop(accounts);
+                                crate::messenger::windows::trace(format!("通知 {id}·创建 {created} 未能绑定 {} 账号（{reason}）",client.name()));
+                            }
+                            target
+                        }else{None};
                         if !body.trim().is_empty(){
                             // QQ 类系统通知的 payload 里带「点开跳哪条会话」和发送方头像；一次只读查询，取不到就不影响提醒。
                             let toast=client.filter(|client|client.adapter().capture==crate::messenger::Capture::SystemToast)
@@ -747,7 +765,7 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
                     }
                 }
                 baseline.finish(current,complete);
-                accounts.retain(|client,id,created|baseline.previous.as_ref().and_then(|items|items.get(&id)).is_some_and(|item|item.created==created && item.client==Some(client)));
+                accounts.lock().unwrap_or_else(|poison|poison.into_inner()).retain(|client,id,created|baseline.previous.as_ref().and_then(|items|items.get(&id)).is_some_and(|item|item.created==created && item.client==Some(client)));
                 messages.sort_by_key(|item|item.0);
                 for (_,app,id,body,target,toast) in messages {
                     if !send(Incoming::Message(app,id,body,target,toast)){return Ok(());}
@@ -763,6 +781,7 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
         if let Err(e) = run() {
             send(Incoming::Status(format!("Windows 暂不允许读取通知：{}。请检查通知访问权限与应用身份。",e.code())));
         }
+        sampler.store(false,std::sync::atomic::Ordering::Relaxed);
     }).map_err(|_|windows::core::Error::from_win32())?;
     Ok(Notifications{incoming:rx,stop,taskbar_mask})
 }
