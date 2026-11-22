@@ -133,6 +133,8 @@ impl App {
         } else {
             CaptureSource::SystemLoopback
         };
+        // 旧版本允许过 720，用户设置里可能还留着越界值；这里就地夹回画布范围。
+        self.settings.caption_bar_width = self.settings.caption_bar_width.clamp(360, 616);
         let target = self.settings.caption_target_lang.clone();
         let lang = self.settings.caption_lang.clone();
         // 源语言和目标语言相同时翻译没有意义（NLLB 会给出另一句中文），
@@ -149,6 +151,10 @@ impl App {
             model: self.settings.caption_model.clone(),
             force_cpu: self.settings.caption_device == 1,
             beam: self.settings.caption_beam.max(1),
+            translate_backend: self.settings.caption_translate_backend.min(2),
+            api_url: self.settings.caption_api_url.clone(),
+            api_key: self.settings.caption_api_key.clone(),
+            api_model: self.settings.caption_api_model.clone(),
         };
         let changed = self.caption_cfg.as_ref().is_some_and(|old| {
             old.engine != cfg.engine
@@ -160,6 +166,10 @@ impl App {
                 || old.model != cfg.model
                 || old.force_cpu != cfg.force_cpu
                 || old.beam != cfg.beam
+                || old.translate_backend != cfg.translate_backend
+                || old.api_url != cfg.api_url
+                || old.api_key != cfg.api_key
+                || old.api_model != cfg.api_model
         });
         if !self.caption.active() {
             // 只在「还没起过」时拉起一次。线程挂了（侧车报错、端口冲突）就停在
@@ -614,6 +624,12 @@ impl App {
             ui.separator();
             ui.label(egui::RichText::new("音源").size(11.5).color(egui::Color32::from_gray(150)));
             settings_segmented(ui, &mut self.settings.caption_engine, &[(0u8, "本机 Whisper"), (1, "系统实时字幕")], 110.0);
+            if self.settings.caption_engine == 1 {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("岛宽度").size(11.0));
+                    ui.add(egui::Slider::new(&mut self.settings.caption_bar_width, 360..=616).suffix(" px"));
+                });
+            }
         ui.add_space(6.0);
         settings_label(ui, "声音来源（Whisper 引擎）");
         settings_segmented(ui, &mut self.settings.caption_source, &[(0u8, "系统声音"), (1, "麦克风")], 86.0);
@@ -652,6 +668,25 @@ impl App {
             };
             if settings_segmented(ui, &mut code, &[("zh", "中文"), ("en", "English"), ("ja", "日本語"), ("ko", "한국어")], 74.0) {
                 self.settings.caption_target_lang = code.to_string();
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("翻译服务").size(11.5).color(egui::Color32::from_gray(150)));
+            settings_segmented(ui, &mut self.settings.caption_translate_backend, &[(0u8, "本机 NLLB"), (1, "Google 免费"), (2, "自定义 API")], 92.0);
+            if self.settings.caption_translate_backend == 2 {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("接口地址").size(11.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.caption_api_url).desired_width(220.0).hint_text("https://api.openai.com/v1"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("API Key").size(11.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.caption_api_key).desired_width(220.0).password(true));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("模型").size(11.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.caption_api_model).desired_width(220.0).hint_text("gpt-4o-mini"));
+                });
+                ui.label(egui::RichText::new("兼容 OpenAI /chat/completions 的服务都能填；Key 只存在本机设置文件里。").size(10.5).color(egui::Color32::from_gray(140)));
             }
         });
         settings_label(ui, "记录");

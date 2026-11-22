@@ -40,6 +40,17 @@ pub struct Line {
     pub done: bool,
 }
 
+/// 岛上渲染用的轻量快照。
+#[derive(Clone, Debug, Default)]
+pub struct IslandView {
+    pub status: Status,
+    pub translate: bool,
+    pub lang: String,
+    pub target: String,
+    /// 最近三句（按时间顺序），只用于拼滚动文本窗。
+    pub lines: Vec<Line>,
+}
+
 /// UI 侧读到的不可变快照。
 #[derive(Clone, Debug, Default)]
 pub struct View {
@@ -86,6 +97,11 @@ pub struct StartConfig {
     pub model: String,
     pub force_cpu: bool,
     pub beam: u8,
+    /// 0 = 本机 NLLB 侧车；1 = Google 免费接口；2 = OpenAI 兼容接口。
+    pub translate_backend: u8,
+    pub api_url: String,
+    pub api_key: String,
+    pub api_model: String,
 }
 
 enum Cmd {
@@ -130,6 +146,27 @@ impl Captions {
         match self.shared.lock() {
             Ok(shared) => shared.view.clone(),
             Err(poisoned) => poisoned.into_inner().view.clone(),
+        }
+    }
+
+    /// 岛上每帧只需要的轻量快照：状态 + 最后三条文本。
+    /// clone 整份 history（上限 2000 行）会让悬停展开动画明显掉帧。
+    pub fn island(&self) -> IslandView {
+        let shared = self.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let view = &shared.view;
+        let mut recent: Vec<Line> = Vec::new();
+        for line in view.history.iter().skip(view.session_start).rev() {
+            if line.text.trim().is_empty() { continue; }
+            recent.push(line.clone());
+            if recent.len() == 3 { break; }
+        }
+        recent.reverse();
+        IslandView {
+            status: view.status,
+            translate: view.translate,
+            lang: view.lang.clone(),
+            target: view.target.clone(),
+            lines: recent,
         }
     }
 
@@ -334,7 +371,7 @@ fn run_live(
     let mut sidecar: Option<crate::caption_runtime::Sidecar> = None;
     let mut jobs: Option<mpsc::Sender<(String, String, String)>> = None;
     let mut worker: Option<std::thread::JoinHandle<()>> = None;
-    if cfg.translate {
+    if cfg.translate && cfg.translate_backend == 0 {
         let stage = |text: &str| {
             publish(&shared, |view| {
                 if view.status == Status::Starting {
@@ -358,7 +395,12 @@ fn run_live(
                 let (tx, queue) = mpsc::channel::<(String, String, String)>();
                 let tr_shared = shared.clone();
                 worker = Some(std::thread::spawn(move || {
-                    while let Ok((id, text, src)) = queue.recv() {
+                    while let Ok(mut job) = queue.recv() {
+                        // 翻译永远只追最新一句：慢的时候宁可跳过中间句，也不要排长队。
+                        while let Ok(next) = queue.try_recv() {
+                            job = next;
+                        }
+                        let (id, text, src) = job;
                         let body = serde_json::json!({
                             "text": text,
                             "src": src,
@@ -408,6 +450,35 @@ fn run_live(
         }
     }
 
+    if cfg.translate && cfg.translate_backend != 0 {
+        let target = cfg.target.clone();
+        let backend = cfg.translate_backend;
+        let url = cfg.api_url.clone();
+        let key = cfg.api_key.clone();
+        let model = cfg.api_model.clone();
+        let (tx, queue) = mpsc::channel::<(String, String, String)>();
+        let tr_shared = shared.clone();
+        worker = Some(std::thread::spawn(move || {
+            while let Ok(mut job) = queue.recv() {
+                while let Ok(next) = queue.try_recv() {
+                    job = next;
+                }
+                let (id, text, src) = job;
+                if let Some(translated) =
+                    translate_remote(backend, &url, &key, &model, &text, &src, &target)
+                {
+                    publish(&tr_shared, |view| {
+                        if let Some(line) = view.history.iter_mut().rev().find(|line| line.id == id)
+                        {
+                            line.translation = translated;
+                        }
+                    });
+                }
+            }
+        }));
+        jobs = Some(tx);
+    }
+
     publish(&shared, |view| {
         view.status = Status::Running;
         view.stage.clear();
@@ -419,6 +490,9 @@ fn run_live(
 
     let mut last_text = String::new();
     // 还在增长的那半句只有一条：快照每来一次就更新它，不能每来一次就多一行。
+    // 会话前缀必须唯一：live-part-1 这种短 id 跨会话会撞车，命中上一场的历史行后
+    // 新句会被写到 session_start 之前，岛上永远只看到「正在听…」。
+    let session = format!("{:08x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) as u32);
     let mut open_id: Option<String> = None;
     let mut open_seq = 0usize;
     loop {
@@ -451,31 +525,48 @@ fn run_live(
                         let id = if last && !sentence.final_ {
                             if open_id.is_none() {
                                 open_seq += 1;
-                                open_id = Some(format!("live-part-{open_seq}"));
+                                open_id = Some(format!("live-{session}-part-{open_seq}"));
                             }
                             open_id.clone().unwrap_or_default()
                         } else if last && sentence.final_ {
-                            open_id.take().unwrap_or_else(|| format!("live-{:08x}", fnv1a(&sentence.text)))
+                            open_id.take().unwrap_or_else(|| format!("live-{session}-{:08x}", fnv1a(&sentence.text)))
                         } else {
-                            format!("live-{:08x}", fnv1a(&sentence.text))
+                            format!("live-{session}-{:08x}", fnv1a(&sentence.text))
                         };
                         let lang = detect_lang(&sentence.text).to_string();
+                        // 已经在记录里且早已定稿的句子不再翻译：刚打开翻译时，
+                        // 系统字幕会把前面几行一起送进来，不能把它们重新翻一遍。
+                        let existed_done = shared
+                            .lock()
+                            .map(|shared| {
+                                shared
+                                    .view
+                                    .history
+                                    .iter()
+                                    .enumerate()
+                            .any(|(index, line)| index < shared.view.session_start && line.id == id && line.done)
+                            })
+                            .unwrap_or(false);
                         publish(&shared, |view| {
-                            if let Some(line) =
-                                view.history.iter_mut().rev().find(|line| line.id == id)
-                            {
-                                line.text = sentence.text.clone();
-                                line.done = sentence.final_;
-                                line.lang = lang.clone();
-                            } else {
-                                view.history.push(Line {
-                                    id: id.clone(),
-                                    text: sentence.text.clone(),
-                                    lang: lang.clone(),
-                                    done: sentence.final_,
-                                    ..Default::default()
-                                });
+                            // 定稿句到达时，清掉同一文本的半句占位行，否则记录里
+                            // 会同时留着「正在识别」和「已定稿」两份一样的字。
+                            if sentence.final_ {
+                                if let Some(index) = view.history.iter().position(|line| {
+                                    line.id.contains("-part-") && line.text.trim() == sentence.text.trim()
+                                }) {
+                                    view.history.remove(index);
+                                }
                             }
+                            // 先摘掉旧行再追加：同一快照里多句时，半句被原地更新会
+                            // 留在旧位置，历史顺序就反了（top/bottom 颠倒）。
+                            let existing = view.history.iter().position(|line| line.id == id);
+                            let mut line = existing.map(|index| view.history.remove(index)).unwrap_or_default();
+                            line.id = id.clone();
+                            line.text = sentence.text.clone();
+                            line.done = sentence.final_;
+                            line.lang = lang.clone();
+                            if !sentence.final_ { line.translation.clear(); }
+                            view.history.push(line);
                             view.lines =
                                 view.history.iter().rev().take(6).rev().cloned().collect();
                             view.lang = lang.clone();
@@ -487,7 +578,7 @@ fn run_live(
                                 sentence.text.clone()
                             };
                         });
-                        if sentence.final_ {
+                        if sentence.final_ && !existed_done {
                             if let Some(jobs) = &jobs {
                                 if cfg.translate && !same_language(&lang, &cfg.target) {
                                     let _ = jobs.send((id, sentence.text.clone(), lang));
@@ -887,6 +978,67 @@ fn dedupe_history(history: &mut Vec<Line>, from: usize) {
 }
 
 
+
+/// 云端翻译：不依赖本机 NLLB，适合本机速度跟不上时使用。
+fn translate_remote(
+    backend: u8,
+    base_url: &str,
+    key: &str,
+    model: &str,
+    text: &str,
+    src: &str,
+    tgt: &str,
+) -> Option<String> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    if backend == 1 {
+        let url = format!(
+            "https://translate.googleapis.com/translate_a/single?client=gtx&sl={}&tl={}&dt=t&q={}",
+            urlencoding(src),
+            urlencoding(tgt),
+            urlencoding(text)
+        );
+        let body = ureq::get(&url)
+            .timeout(Duration::from_secs(12))
+            .call()
+            .ok()?
+            .into_string()
+            .ok()?;
+        let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+        let first = value.get(0)?.get(0)?.get(0)?.as_str()?.trim().to_string();
+        return (!first.is_empty()).then_some(first);
+    }
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": format!("Translate the user's text from {src} to {tgt}. Reply with the translation only, no quotes, no explanation.")},
+            {"role": "user", "content": text}
+        ]
+    })
+    .to_string();
+    let mut request = ureq::post(&url)
+        .timeout(Duration::from_secs(20))
+        .set("Content-Type", "application/json");
+    if !key.trim().is_empty() {
+        request = request.set("Authorization", &format!("Bearer {}", key.trim()));
+    }
+    let body = request.send_string(&body).ok()?.into_string().ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let out = value
+        .get("choices")?
+        .get(0)?
+        .get("message")?
+        .get("content")?
+        .as_str()?
+        .trim()
+        .to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+
 fn publish(shared: &Arc<Mutex<Shared>>, edit: impl FnOnce(&mut View)) {
     if let Ok(mut shared) = shared.lock() {
         edit(&mut shared.view);
@@ -1081,6 +1233,10 @@ mod tests {
             model: "base".into(),
             force_cpu: true,
             beam: 1,
+            translate_backend: 0,
+            api_url: String::new(),
+            api_key: String::new(),
+            api_model: String::new(),
         });
         // start() 之后 session_start 必须等于已有的历史条数，
         // 第一帧新字幕不能被旧记录挡住。

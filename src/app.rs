@@ -54,7 +54,8 @@ pub(crate) const LYRIC_BAR_W: f32 = 300.0;
 pub(crate) const CAPTION_BAR_W: f32 = 440.0;
 /// 字幕条用两行：上面原文、下面译文（或正在增长的那半句）。
 /// 单行时再长也只能塞进一行省略号，读不到后半句——这是用户明确点名的毛病。
-pub(crate) const CAPTION_BAR_H: f32 = 52.0;
+pub(crate) const CAPTION_BAR_H: f32 = 56.0;
+pub(crate) const CAPTION_BAR_H_TR: f32 = 96.0;
 pub(crate) const HUD_TRACK_X: f32 = 48.0;
 pub(crate) const HUD_TRACK_W: f32 = 150.0;
 pub const BAR_W_MIN: f32 = 44.0; // 极简小条
@@ -955,6 +956,9 @@ pub struct App {
     pub(crate) caption_scroll: f32,
     /// 记录列表可滚动到底的最大偏移，由列表渲染时回报。
     pub(crate) caption_max_scroll: f32,
+    /// 岛上字幕每次换句的起始时间：用来做短促的向上滑入动画。
+    caption_at: f64,
+    caption_key: String,
     pub(crate) caption_follow: bool,
     /// 开机自动开启字幕只做一次，之后尊重用户的手动开关。
     caption_boot: bool,
@@ -1140,6 +1144,8 @@ impl App {
         caption_clear_at: None,
         caption_scroll: 0.0,
         caption_max_scroll: 0.0,
+        caption_at: 0.0,
+        caption_key: String::new(),
             caption_follow: true,
         caption_boot: false,
         }
@@ -1832,7 +1838,8 @@ impl App {
     }
     /// 字幕条是否应当盖过全屏隐藏规则。主循环在 bin crate 里，不能读 crate 私有字段。
     pub fn caption_bar_visible(&self)->bool {
-        let view=self.caption.view();
+        // 轻量快照：只取状态与最后几条，别在悬停动画里 clone 整份历史。
+        let view=self.caption.island();
         let visible=self.settings.caption_on_island
             && !self.open
             && matches!(view.status,crate::caption::Status::Running|crate::caption::Status::Starting);
@@ -1844,7 +1851,7 @@ impl App {
                 LAST.store(now,Ordering::Relaxed);
                 if let Ok(mut f)=std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                     use std::io::Write;
-                    let _=writeln!(f,"{{\"island\":true,\"visible\":{},\"on\":{},\"open\":{},\"status\":\"{:?}\",\"history\":{},\"last\":\"{}\"}}",visible,self.settings.caption_on_island,self.open,view.status,view.history.len(),view.history.last().map(|l|l.text.chars().take(12).collect::<String>()).unwrap_or_default());
+                    let _=writeln!(f,"{{\"island\":true,\"visible\":{},\"on\":{},\"open\":{},\"status\":\"{:?}\",\"history\":{},\"last\":\"{}\"}}",visible,self.settings.caption_on_island,self.open,view.status,view.lines.len(),view.lines.last().map(|l|l.text.chars().take(12).collect::<String>()).unwrap_or_default());
                 }
             }
         }
@@ -1934,7 +1941,12 @@ impl App {
     }
     fn lyric_focus_space(&self)->f32 {if self.pomo.running{crate::focus_bar::LYRIC_WIDTH+10.0}else{0.0}}
     fn lyric_bar_width(&self)->f32 {LYRIC_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()}
-    fn caption_bar_width(&self)->f32 {CAPTION_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()}
+    fn caption_bar_width(&self)->f32 {
+        let base=if self.settings.caption_engine==1 {self.settings.caption_bar_width as f32}else{CAPTION_BAR_W};
+        (base+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()).min(WIN_W-24.0)
+    }
+    fn caption_bar_height(&self)->f32 {if self.caption.island().translate{CAPTION_BAR_H_TR}else{CAPTION_BAR_H}}
+
     /// 当前滚动条用哪套宽度：歌词占位优先，其次字幕。
     fn island_ticker_width(&self)->f32 {if self.island_lyrics_active(){self.lyric_bar_width()}else{self.caption_bar_width()}}
     fn notice_size(&self,a:&Alert)->(f32,f32) {
@@ -1955,7 +1967,7 @@ impl App {
         // 实时字幕在跑的时候，药丸优先给字幕：通知/角标会把它整个盖掉，
         // 用户看到的就是「开了字幕但岛上什么都没有」。
         if !self.open && self.island_caption_active() {
-            return (self.caption_bar_width(),CAPTION_BAR_H);
+            return (self.caption_bar_width(),self.caption_bar_height());
         }
         if !self.compact_notices()&&!self.open {
             if let Some(a)=&self.notice {let (width,height)=self.notice_size(a);return (width+self.pet_space(),height);}
@@ -1968,7 +1980,7 @@ impl App {
             (self.lyric_bar_width(),BAR_H)
         } else if self.island_caption_active() {
             // 字幕要两行（原文上、译文下），药丸跟着长高，不然第二行画到窗外。
-            (self.caption_bar_width(),CAPTION_BAR_H)
+            (self.caption_bar_width(),self.caption_bar_height())
         } else if self.effective_minimal()&&self.t>=self.notification_bell_until {
             (BAR_W_MIN, BAR_H_MIN)
         } else {
@@ -2462,7 +2474,7 @@ impl App {
             || self.notice.as_ref().is_some_and(|notice|notice.meeting.is_some());
         let animating=transitioning || ambient || pet_visible && self.pet.state!=PetState::Sleeping;
         // 交互形变保持 60 帧，媒体 30 帧；小表情 20 帧，睡眠 10 帧，静态界面每秒核对提醒。
-        let repaint_after=std::time::Duration::from_secs_f64(if transitioning{1.0/60.0}else if ambient{1.0/30.0}else if pet_visible{if self.pet.state==PetState::Sleeping{0.1}else{0.05}}else{1.0});
+        let repaint_after=std::time::Duration::from_secs_f64(if transitioning||!self.w.settled(0.5)||!self.h.settled(0.5){1.0/120.0}else if ambient{1.0/30.0}else if pet_visible{if self.pet.state==PetState::Sleeping{0.1}else{0.05}}else{1.0});
         cmds.append(&mut self.pending);
         let next_hit=if side {self.side_hit_rect(win,self.progress())} else {self.hit_rect(cx,top,self.progress())};
         if page_before!=self.page && self.open {
@@ -3142,99 +3154,112 @@ impl App {
         // 实时字幕条：没有歌词时占用药丸，替代时钟区。两行——上行原文、下行译文；
         // 单行时再长也只能看前半句，所以药丸在这时会长高（见 base_size / CAPTION_BAR_H）。
         if !self.island_lyrics_active() && self.island_caption_active() {
-            let view=self.caption.view();
+            let view=self.caption.island();
             // 药丸优先显示「最近一条已译好的」：最新一句常常还在等译文，
             // 只显示原文会让「原文字语言 + 译文目标语言」这个承诺落空。
             // 岛上是「最新一句」的镜像：先跟最新原文，再补译文。
             // 不能为了等译文停在旧句上——展开页已经到下一句，药丸还挂在上一句就是脱节。
             // 只看本场新内容：上一场留下的旧句不该在刚开启时冒充「正在识别」。
-            let last=view.history.iter().skip(view.session_start).rev().find(|line|!line.text.trim().is_empty());
-            let placeholder=crate::caption::Line{text:"正在听…".into(),..Default::default()};
-            let last=last.or(Some(&placeholder));
-            if let Some(line)=last {
-                let caption_alpha=1.0-smoothstep(0.0,0.35,p);
-                if caption_alpha>0.003 {
-                    let c=base.faded(caption_alpha);
-                    let content_width=self.caption_bar_width()-self.lyric_focus_space();
-                    let width=self.w.pos.max(content_width);
-                    let left=local_cx-width/2.0;
-                    let center_y=CAPTION_BAR_H/2.0;
-                    let right=left+content_width-12.0;
-                    let mut x=left+12.0;
-                    let tag=if view.lang.trim().is_empty(){String::new()}else{crate::caption_ui::language_tag(&view.lang)};
-                    let tag=if view.translate&&!view.target.trim().is_empty()&&!tag.is_empty()
-                        {format!("[{tag}>{}]",crate::caption_ui::language_tag(&view.target))}else{format!("[{tag}]")};
-                    if tag=="[]" {
-                        c.circle(x+3.0,center_y,2.2,theme::CYAN);
-                        x+=12.0;
-                    } else {
-                        x+=c.text(x,center_y+3.5,&tag,10.0,W::Semibold,theme::CYAN,H::Left)+7.0;
+            // 岛上是「从上到下」的滚动窗口：上面一句、下面最新一句；
+            // 有新句时整块向上滑一小段，像提词器一样换行，而不是硬跳。
+            // 岛上是「滚动文本窗」：把本场句子连成一段，按宽度换行，只留最后两行
+            // （开翻译时原文两行 + 译文两行）。不是「一句一行」——那会在长句换行时变四行。
+            let recent: Vec<&crate::caption::Line> = view.lines.iter()
+                .filter(|line| !line.text.trim().is_empty())
+                .collect();
+            let join = |items: Vec<&str>| -> String {
+                let mut out = String::new();
+                for item in items {
+                    let item = item.trim();
+                    if item.is_empty() || out.ends_with(item) { continue; }
+                    if !out.is_empty() && !out.ends_with([' ', '，', '。', '！', '？', ',', '.', '!', '?']) {
+                        out.push(' ');
                     }
-                    // 吉祥物坐在药丸左侧（PET 中心距左沿 60），字幕从它右边起排，别糊在脸上。
-                    if self.pet_enabled() {x=x.max(left+90.0);}
-                    let avail=(right-x).max(0.0);
-                    let latest=line.text.trim();
-                    let previous=view.history.iter().skip(view.session_start).rev()
-                        .filter(|row|!row.text.trim().is_empty())
-                        .nth(1)
-                        .map(|row|row.text.trim().to_string());
-                    let translation=line.translation.trim();
-                    let partial=view.partial.trim();
-                    // 断句优先：超过可用宽度时退到最近的句末/逗号，别从词中间切。
-                    let fit_sentence=|text:&str,size:f32,weight:W,max:f32|->String{
-                        if c.text_w(text,size,weight)<=max{return text.to_string();}
-                        let mut best=None;
-                        for (index,ch) in text.char_indices(){
-                            let width=c.text_w(&text[..index+ch.len_utf8()],size,weight);
-                            if width>max{break;}
-                            if "。！？!?，,；;、 ".contains(ch){best=Some(index+ch.len_utf8());}
+                    out.push_str(item);
+                }
+                out
+            };
+            let tail: Vec<&crate::caption::Line> = recent.iter().rev().take(4).rev().copied().collect();
+            let original = join(tail.iter().map(|line| line.text.as_str()).collect());
+            let translated = join(tail.iter().map(|line| line.translation.as_str()).filter(|t| !t.trim().is_empty()).collect());
+            // 只在「换句」时做一次上滑；同一句还在增长时不要每帧重置动画。
+            let key = recent.last().map(|line| line.id.clone()).unwrap_or_default();
+            if self.caption_key != key { self.caption_key = key; self.caption_at = self.t; }
+            let anim = ((self.t - self.caption_at) / 0.22).clamp(0.0, 1.0) as f32;
+            let slide = (1.0 - anim) * 8.0;
+            let caption_alpha = 1.0 - smoothstep(0.0, 0.35, p);
+            if caption_alpha > 0.003 {
+                let c = base.faded(caption_alpha);
+                let content_width = self.caption_bar_width() - self.lyric_focus_space();
+                let width = self.w.pos.max(content_width);
+                let left = local_cx - width / 2.0;
+                let right = left + content_width - 12.0;
+                // 语言标签只往左让一点，别为了躲吉祥物整块右移。
+                let mut x = left + if self.pet_enabled() { 64.0 } else { 12.0 };
+                // 刚开启时 UIA 还没吐出语言，不能因此把 [ZH] 变成一个小圆点；
+                // 用设置里的识别语言兜底，标签始终可见。
+                let lang = if view.lang.trim().is_empty() { self.settings.caption_lang.clone() } else { view.lang.clone() };
+                let tag = if lang.trim().is_empty() || lang == "mixed" { String::new() } else { crate::caption_ui::language_tag(&lang) };
+                let tag = if view.translate && !view.target.trim().is_empty() && !tag.is_empty() {
+                    format!("[{tag}>{}]", crate::caption_ui::language_tag(&view.target))
+                } else {
+                    format!("[{tag}]")
+                };
+                if tag == "[]" {
+                    c.circle(x + 3.0, 20.0, 2.2, theme::CYAN);
+                    x += 12.0;
+                } else {
+                    x += c.text(x, 20.0, &tag, 10.0, W::Semibold, theme::CYAN, H::Left) + 7.0;
+                }
+                let avail = (right - x).max(60.0);
+                let wrap = |text: &str, size: f32, weight: W| -> Vec<String> {
+                    let mut lines: Vec<String> = Vec::new();
+                    let mut current = String::new();
+                    let mut used = 0.0f32;
+                    for ch in text.chars() {
+                        // 估算宽度即可：每字符跑一次 text_w 会在长句上明显拖慢悬停动画。
+                        let w = if ch.is_ascii() { size * 0.56 } else { size };
+                        if used + w > avail && !current.is_empty() {
+                            lines.push(std::mem::take(&mut current));
+                            used = 0.0;
                         }
-                        match best {Some(cut)=>format!("{}…",&text[..cut]),None=>c.fit(text,size,weight,max)}
-                    };
-                    // 没开翻译：上行上一句、下行最新一句，两行都是识别结果。
-                    let (top_text,top_done)=if view.translate {
-                        (latest.to_string(),line.done)
-                    } else if let Some(previous)=previous.as_deref() {
-                        (previous.to_string(),true)
-                    } else {
-                        (latest.to_string(),line.done)
-                    };
-                    let bottom:Option<(String,egui::Color32)>=if view.translate {
-                        if !translation.is_empty(){
-                            Some((translation.to_string(),theme::CYAN))
-                        }else{
-                            Some(("翻译中…".to_string(),theme::DIM))
-                        }
-                    } else if previous.is_some(){
-                        Some((latest.to_string(),if line.done{theme::WHITE}else{theme::GRAY}))
-                    } else if !partial.is_empty()&&partial!=latest {
-                        Some((partial.to_string(),theme::GRAY))
-                    } else {
-                        None
-                    };
-                    let ink=if top_done {theme::WHITE}else{theme::GRAY};
-                    match bottom {
-                        Some((sub,tint)) => {
-                            let first_size=if c.text_w(&top_text,12.0,W::Semibold)<=avail {12.0}
-                                else if c.text_w(&top_text,10.5,W::Semibold)<=avail {10.5} else {9.0};
-                            let first=fit_sentence(&top_text,first_size,W::Semibold,avail);
-                            c.text(x,21.0,&first,first_size,W::Semibold,ink,H::Left);
-                            let sub_size=if c.text_w(&sub,10.5,W::Regular)<=avail {10.5} else {9.0};
-                            let sub=fit_sentence(&sub,sub_size,W::Regular,avail);
-                            c.text(x,39.0,&sub,sub_size,W::Regular,tint,H::Left);
-                        }
-                        None => {
-                            let text=fit_sentence(&top_text,12.0,W::Semibold,avail);
-                            c.text(x,center_y+4.5,&text,12.0,W::Semibold,ink,H::Left);
-                        }
+                        current.push(ch);
+                        used += w;
                     }
-                    if self.pomo.running {
-                        let alpha=smoothstep(0.88,1.0,(width-content_width)/self.lyric_focus_space());
-                        crate::focus_bar::draw(&c.faded(alpha),left+width-14.0-crate::focus_bar::LYRIC_WIDTH/2.0,center_y,self.t,&self.pomo,self.phase_secs(self.pomo.phase),true);
+                    if !current.is_empty() { lines.push(current); }
+                    lines
+                };
+                let mut row = |text: &str, size: f32, weight: W, color: egui::Color32, y: &mut f32| {
+                    for line in wrap(text, size, weight) {
+                        c.text(x, *y + slide, &line, size, weight, color, H::Left);
+                        *y += size + 5.0;
                     }
-                    return;
+                };
+                let orig_rows = wrap(&original, 12.0, W::Semibold);
+                let orig: Vec<String> = orig_rows.iter().rev().take(2).rev().cloned().collect();
+                let mut y = 4.0f32;
+                if orig.is_empty() {
+                    c.text(x, 26.0, "正在听…", 12.0, W::Regular, theme::DIM, H::Left);
+                } else {
+                    for line in &orig { row(line, 12.0, W::Semibold, theme::WHITE, &mut y); }
+                }
+                if view.translate {
+                    let tr_rows = wrap(&translated, 11.0, W::Regular);
+                    let tr: Vec<String> = tr_rows.iter().rev().take(2).rev().cloned().collect();
+                    if tr.is_empty() {
+                        if !original.trim().is_empty() {
+                            c.text(x, y + 11.0 + slide, "翻译中…", 10.5, W::Regular, theme::DIM, H::Left);
+                        }
+                    } else {
+                        for line in &tr { row(line, 11.0, W::Regular, theme::CYAN, &mut y); }
+                    }
                 }
             }
+            if self.pomo.running {
+                let width = self.w.pos;
+                crate::focus_bar::draw(&base, local_cx + width / 2.0 - 14.0 - crate::focus_bar::LYRIC_WIDTH / 2.0, self.caption_bar_height() / 2.0, self.t, &self.pomo, self.phase_secs(self.pomo.phase), true);
+            }
+            return;
         }
         let clock = self.settings.clock_text(&env.clock);
         let show_battery=self.settings.show_battery && env.battery.is_some();
@@ -3417,6 +3442,10 @@ impl App {
         let gaze = env.cursor.map(|p| [((p.x-cx)/28.0).clamp(-3.0,3.0), ((p.y-15.0)/40.0).clamp(-1.0,1.5)])
             .unwrap_or([(self.t as f32 * 0.35).sin()*0.8, 0.0]);
         self.pet.step(state, self.t, self.dt, gaze, visible);
+        // 播字幕时吉祥物必须一直在场：它一打瞌睡就会淡出，看起来像「表情时有时无」。
+        if self.island_caption_active() && matches!(self.pet.state, PetState::Dozing | PetState::Sleeping) {
+            self.pet.state = PetState::Awake;
+        }
     }
 
     // ---------------------------------------------------------------

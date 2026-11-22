@@ -43,8 +43,9 @@ use windows::Win32::UI::Accessibility::{
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongW, SetWindowLongW, ShowWindow, GWL_EXSTYLE, SW_MINIMIZE, SW_RESTORE,
-    WS_EX_TOOLWINDOW,
+    GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SW_RESTORE, SW_SHOWNOACTIVATE, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
 };
 
 #[cfg(windows)]
@@ -145,14 +146,9 @@ impl LiveCaptions {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        // 线程正常退出时已经恢复过一次；这里再兜一次底（线程 panic 时也能恢复）。
-        #[cfg(windows)]
-        {
-            let raw = self.hwnd.swap(0, Ordering::SeqCst);
-            if raw != 0 {
-                unsafe { restore_window(HWND(raw as *mut core::ffi::c_void)) };
-            }
-        }
+        // 停止字幕时不要把 LiveCaptions 窗口放出来：它只是取字用的后台进程。
+        // 恢复窗口只留给用户显式点「显示系统窗口」（show_window）。
+        self.hwnd.store(0, Ordering::SeqCst);
     }
 
     /// 取消隐藏：去掉 WS_EX_TOOLWINDOW 并 SW_RESTORE。
@@ -459,7 +455,9 @@ impl Worker {
         unsafe {
             if let Ok(hwnd) = window.CurrentNativeWindowHandle() {
                 let raw = hwnd.0 as isize;
-                if raw != 0 && raw != self.hidden_hwnd {
+                if raw != 0 {
+                    // 用户可能用 Win+Ctrl+L 把窗口重新显示出来（hwnd 不变），
+                    // 所以每次轮询都压回透明，不能只在第一次隐藏。
                     hide_window(hwnd);
                     self.hidden_hwnd = raw;
                     self.hwnd_slot.store(raw, Ordering::SeqCst);
@@ -600,26 +598,33 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
-/// 最小化 + 工具窗口样式：不占任务栏、不进 Alt-Tab，但仍在后台转写。
+/// 完全透明 + 工具窗口样式：窗口不最小化、不占任务栏、不进 Alt-Tab，也不会在屏幕角落露出来。
+/// 用分层窗口把 alpha 降到 0，窗口仍在正常渲染，UI Automation 的文本才会持续更新；
+/// 最小化在 Win11 上会把它缩成左下角一块可见的卡片，用户能直接拉出来。
 #[cfg(windows)]
 unsafe fn hide_window(hwnd: HWND) {
     let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
     let toolwindow = WS_EX_TOOLWINDOW.0 as i32;
-    if ex_style & toolwindow == 0 {
-        SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | toolwindow);
+    let layered = WS_EX_LAYERED.0 as i32;
+    if ex_style & (toolwindow | layered) != (toolwindow | layered) {
+        SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | toolwindow | layered);
     }
-    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 0, LWA_ALPHA);
 }
 
-/// 取消隐藏：去掉 WS_EX_TOOLWINDOW 并恢复窗口。
+/// 取消隐藏：恢复不透明、去掉工具窗口样式并还原窗口。
 #[cfg(windows)]
 unsafe fn restore_window(hwnd: HWND) {
     let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
     let toolwindow = WS_EX_TOOLWINDOW.0 as i32;
+    // 保留 WS_EX_LAYERED，只把 alpha 调回 255；先去掉分层再设 alpha 是无效的。
     if ex_style & toolwindow != 0 {
         SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !toolwindow);
     }
-    let _ = ShowWindow(hwnd, SW_RESTORE);
+    let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 255, LWA_ALPHA);
+    let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 }
 
 // ---------------------------------------------------------------------------
