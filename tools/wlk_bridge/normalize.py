@@ -329,6 +329,41 @@ def _merge_continuations(lines: list[dict]) -> list[dict]:
     return merged
 
 
+def _merge_short_fragments(lines: list[dict]) -> list[dict]:
+    """Fold tiny ASR fragments into the row before them.
+
+    WhisperLiveKit re-decodes a rolling buffer, so Chinese output often arrives
+    as ``来到产品会。`` + ``议。`` instead of one sentence.  Rows shorter than
+    10 characters carry no useful meaning on their own; glue them onto the
+    previous row until it grows past a comfortable subtitle width.
+    """
+    merged: list[dict] = []
+    for line in lines:
+        text = str(line.get("text") or "").strip()
+        if not text:
+            continue
+        if merged:
+            previous = merged[-1]
+            head = str(previous.get("text") or "").rstrip()
+            joined = _join(head.rstrip(".!?。！？"), text)
+            if (
+                head[-1:] in ".!?。！？"
+                and _visible_len(text) < 10
+                and _visible_len(joined) <= 24
+            ):
+                previous["text"] = joined
+                previous["end"] = line.get("end", previous.get("end"))
+                previous["final"] = bool(previous.get("final")) and bool(line.get("final"))
+                previous["translation"] = ""
+                continue
+        merged.append(dict(line))
+    return merged
+
+
+def _visible_len(text: str) -> int:
+    return len("".join(str(text).split()))
+
+
 def _dedupe_lines(lines: list[dict]) -> list[dict]:
     """Collapse duplicate rows, preferring line id over text.
 
@@ -451,7 +486,7 @@ def to_caption_event(
     if top_lang:
         state["last_lang"] = top_lang
 
-    lines = _dedupe_lines(lines)
+    lines = _dedupe_lines(_merge_short_fragments(lines))
 
     lang_prob = front_dict.get("lang_prob")
     try:

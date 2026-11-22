@@ -3151,10 +3151,14 @@ impl App {
                     };
                     match second {
                         Some((sub,tint)) => {
-                            let first=c.fit(original,12.0,W::Semibold,avail);
-                            c.text(x,21.0,&first,12.0,W::Semibold,ink,H::Left);
-                            let sub=c.fit(sub,10.5,W::Regular,avail);
-                            c.text(x,39.0,&sub,10.5,W::Regular,tint,H::Left);
+                            // 句子长的时候先缩字号，缩到 9pt 还放不下才截断，尽量让整句都能看见。
+                            let first_size=if c.text_w(original,12.0,W::Semibold)<=avail {12.0}
+                                else if c.text_w(original,10.5,W::Semibold)<=avail {10.5} else {9.0};
+                            let first=c.fit(original,first_size,W::Semibold,avail);
+                            c.text(x,21.0,&first,first_size,W::Semibold,ink,H::Left);
+                            let sub_size=if c.text_w(sub,10.5,W::Regular)<=avail {10.5} else {9.0};
+                            let sub=c.fit(sub,sub_size,W::Regular,avail);
+                            c.text(x,39.0,&sub,sub_size,W::Regular,tint,H::Left);
                         }
                         None => {
                             let text=c.fit(original,12.0,W::Semibold,avail);
