@@ -301,6 +301,61 @@ def _to_simplified(text: str, lang: str) -> str:
 
 
 
+def _norm_words(text: str) -> list[str]:
+    return " ".join(str(text or "").lower().split()).split()
+
+
+def _strip_overlap(previous: str, text: str) -> str:
+    """Cut the part of ``text`` that merely repeats the tail of ``previous``.
+
+    WhisperLiveKit re-decodes a rolling buffer, so the next row often begins
+    with words that were already shown at the end of the previous row.  Left
+    alone the island shows the same sentence twice (or a row that keeps growing
+    with old text).  We match word-by-word and drop the repeated prefix.
+    """
+    prev_words = _norm_words(previous)
+    words = str(text or "").split()
+    if not prev_words or not words:
+        return str(text or "").strip()
+    limit = min(len(prev_words), len(words), 40)
+    best = 0
+    for size in range(limit, 0, -1):
+        if [w.lower() for w in prev_words[-size:]] == [w.lower().strip(".,!?;:，。！？；：") for w in words[:size]]:
+            best = size
+            break
+    if best >= 3:
+        return " ".join(words[best:]).strip()
+    return " ".join(words).strip()
+
+
+def _strip_tail_echo(text: str, earlier: list[str]) -> str:
+    """Drop an old sentence that WLK glued onto the end of a fresh row.
+
+    After trimming its buffer the server sometimes re-emits the previous rows
+    as a suffix of the new one (``…next quarter. Hello everyone.``).  Comparing
+    normalised text lets us cut that tail without touching genuine repeats a
+    speaker actually said twice in a row.
+    """
+    def bare(value: str) -> str:
+        return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+    cleaned = " ".join(str(text or "").split())
+    for previous in reversed(earlier[-3:]):
+        tail = bare(previous)
+        if len(tail) < 8 or len(bare(cleaned)) <= len(tail):
+            continue
+        if bare(cleaned).endswith(tail):
+            # 逐词从尾部切掉同样多的词，保留原来的大小写与标点。
+            words = cleaned.split()
+            need = len(tail)
+            while words and need > 0:
+                need -= len(bare(words[-1]))
+                words.pop()
+            cleaned = " ".join(words).rstrip(" -—,，")
+            break
+    return cleaned
+
+
 def _merge_continuations(lines: list[dict]) -> list[dict]:
     """Join rows that start mid-sentence onto the row before them.
 
@@ -315,7 +370,14 @@ def _merge_continuations(lines: list[dict]) -> list[dict]:
     for line in lines:
         text = str(line.get("text") or "")
         previous = merged[-1] if merged else None
-        if previous is not None and _CONTINUATION_RE.match(text):
+        if previous is not None:
+            head = str(previous.get("text") or "").rstrip()
+            text = _strip_overlap(head, text)
+            text = _strip_tail_echo(text, [str(row.get("text") or "") for row in merged])
+            if not text:
+                # 整行都是上一行的回声，直接丢掉。
+                continue
+        if previous is not None and _CONTINUATION_RE.match(text) and len(previous.get("text") or "") <= 160:
             head = str(previous.get("text") or "").rstrip()
             if head and head[-1] in ".!?。！？":
                 head = head[:-1]
