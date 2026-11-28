@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows::core::VARIANT;
 #[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, HWND, RPC_E_CHANGED_MODE};
+use windows::Win32::Foundation::{CloseHandle, HWND, RECT, RPC_E_CHANGED_MODE};
 #[cfg(windows)]
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -43,7 +43,7 @@ use windows::Win32::UI::Accessibility::{
 };
 #[cfg(windows)]
 use windows::Win32::Foundation::{BOOL, LPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SetWindowDisplayAffinity,
+use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SetWindowDisplayAffinity,
     GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_RESTORE, SW_SHOWNOACTIVATE, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
@@ -100,8 +100,12 @@ impl LiveCaptions {
     #[cfg(windows)]
     pub fn start() -> Result<LiveCaptions, String> {
         let (pid, child) = match find_live_captions_pid() {
-            // 已有实例就复用，避免拉起第二个 LiveCaptions 抢麦克风。
-            Some(pid) => (pid, None),
+            // 已有实例就复用，避免拉起第二个 LiveCaptions 抢麦克风；
+            // 上一次会话可能把它挪到了屏幕外，复用时先放回屏幕内，等出字后再挪走。
+            Some(pid) => {
+                unpark_pid_windows(pid);
+                (pid, None)
+            }
             None => {
                 let child = Command::new(LIVE_CAPTIONS_EXE)
                     .spawn()
@@ -410,6 +414,10 @@ impl Worker {
                 return true;
             }
         }
+        // 初始化完成后再挪出屏幕：此时 LiveCaptions 已经在识别，挪走不会中断 UIA 更新。
+        if self.caption.is_some() && self.hidden_hwnd != 0 {
+            unsafe { SetWindowPos(HWND(self.hidden_hwnd as *mut core::ffi::c_void), None, -12000, -12000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER); }
+        }
 
         // 4. 找 CaptionsTextBlock。找不到就每轮重试，不做失败计数——
         //    LiveCaptions 启动慢、切主题重建控件都可能短暂找不到。
@@ -659,6 +667,27 @@ fn process_is_live_captions(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
+fn unpark_pid_windows(pid: u32) {
+    unsafe {
+        let _ = EnumWindows(Some(unpark_callback), LPARAM(pid as isize));
+    }
+}
+
+unsafe extern "system" fn unpark_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let pid = lparam.0 as u32;
+    let mut owner = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) };
+    if owner != pid || !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return true.into();
+    }
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() && rect.left <= -10000 {
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+        let _ = unsafe { SetWindowPos(hwnd, None, 120, 120, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER) };
+    }
+    true.into()
+}
+
 fn hide_pid_windows(pid: u32) {
     unsafe extern "system" fn visit(hwnd: HWND, param: LPARAM) -> BOOL {
         let pid = param.0 as u32;
@@ -710,8 +739,8 @@ unsafe fn hide_window(hwnd: HWND) {
     let _ = SetWindowDisplayAffinity(hwnd, windows::Win32::UI::WindowsAndMessaging::WINDOW_DISPLAY_AFFINITY(0x11) /* WDA_EXCLUDEFROMCAPTURE */);
     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 0, LWA_ALPHA);
-    // WinUI 3 的 DirectComposition 忽略分层 alpha（截图/用户桌面仍能看到整块字幕），
-    // DWM cloak 跨进程会被拒绝（E_ACCESSDENIED），所以只能把窗口挪到屏幕外。
+    // WinUI 3 的 DirectComposition 会忽略分层 alpha，必须同时挪到屏幕外；
+    // 实测离屏后 UIA 仍持续更新（history 有新增），不会中断识别。
     let _ = SetWindowPos(hwnd, None, -12000, -12000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
 }
 
