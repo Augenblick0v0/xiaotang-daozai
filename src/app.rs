@@ -71,7 +71,7 @@ pub(crate) const ISLAND_BADGE_TEXT_W: f32 = 64.0;
 pub const FLARE: f32 = 17.6; // 顶部外翻肩宽
 pub const FLARE_H: f32 = 16.0; // 外翻收敛高度
 pub const RAD: f32 = 33.0; // 底部圆角
-pub const WIN_W: f32 = 640.0; // 窗口（透明画布）
+pub const WIN_W: f32 = 2560.0; // 窗口（透明画布）
 pub const CANVAS_W: f32 = WIN_W + 320.0; // 保留右侧通知及阴影的完整空间，原岛仍按 WIN_W 定位。
 pub const WIN_H: f32 = 270.0;
 /// 胶囊皮肤与屏幕顶边的间隙。
@@ -954,6 +954,8 @@ pub struct App {
     pub(crate) caption_clear_at: Option<std::time::Instant>,
     /// 字幕记录的滚动位置（鼠标在列表上时由滚轮驱动）。
     pub(crate) caption_scroll: f32,
+    /// 当前屏幕的逻辑宽度（物理像素 ÷ 缩放），用来夹住全宽字幕条。
+    pub(crate) screen_w: f32,
     /// 记录列表可滚动到底的最大偏移，由列表渲染时回报。
     pub(crate) caption_max_scroll: f32,
     /// 岛上字幕每次换句的起始时间：用来做短促的向上滑入动画。
@@ -1149,6 +1151,7 @@ impl App {
         caption_notice: None,
         caption_clear_at: None,
         caption_scroll: 0.0,
+        screen_w: WIN_W,
         caption_max_scroll: 0.0,
         caption_at: 0.0,
         caption_key: String::new(),
@@ -1954,7 +1957,7 @@ impl App {
     fn lyric_bar_width(&self)->f32 {LYRIC_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()}
     fn caption_bar_width(&self)->f32 {
         let base=if self.settings.caption_engine==1 {self.settings.caption_bar_width as f32}else{CAPTION_BAR_W};
-        (base+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()).min(WIN_W-24.0)
+        (base+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()).min(self.screen_w-24.0)
     }
     fn caption_bar_height(&self)->f32 {if self.caption.island().translate{CAPTION_BAR_H_TR}else{CAPTION_BAR_H}}
 
@@ -2025,6 +2028,11 @@ impl App {
     // ---------------------------------------------------------------
     pub fn frame(&mut self, ui: &mut egui::Ui, win: Rect, env: &Env) -> FrameOut {
         let ctx = ui.ctx().clone();
+        let ppp = ctx.pixels_per_point().max(0.1);
+        if let Some(display) = crate::display_layout::selected(&self.displays, &self.settings.display_id) {
+            let width = (display.bounds.right - display.bounds.left) as f32 / ppp;
+            if width > 200.0 { self.screen_w = width; }
+        }
         let dt = match self.last_t {
             Some(t0) => (env.t - t0).clamp(0.0, 0.1) as f32,
             None => 0.0,
@@ -3997,6 +4005,9 @@ impl App {
         }
     }
 }
+
+
+
 
 
 

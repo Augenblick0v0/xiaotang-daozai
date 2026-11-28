@@ -483,7 +483,7 @@ impl Settings {
                 "caption_on_island" => s.caption_on_island = v!="0",
                 "caption_python" => s.caption_python = v.to_string(),
                 "caption_engine" => s.caption_engine = v.parse::<u8>().ok().filter(|v|*v<=1).unwrap_or(0),
-            "caption_bar_width" => s.caption_bar_width = v.parse::<u16>().ok().filter(|v|(360..=1128).contains(v)).unwrap_or(440),
+            "caption_bar_width" => s.caption_bar_width = v.parse::<u16>().ok().filter(|v|(360..=2536).contains(v)).unwrap_or(440),
             "caption_translate_backend" => s.caption_translate_backend = v.parse::<u8>().ok().filter(|v|*v<=2).unwrap_or(0),
             "caption_api_url" => s.caption_api_url = v,
             "caption_api_key" => s.caption_api_key = v,
@@ -1143,4 +1143,6 @@ impl NotificationApps {
         self.items.push((id.to_string(),name.to_string(),enabled));self.save();enabled
     }
 }
+
+
 

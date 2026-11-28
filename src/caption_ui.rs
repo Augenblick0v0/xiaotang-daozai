@@ -207,7 +207,7 @@ impl App {
             CaptureSource::SystemLoopback
         };
         // 旧版本允许过 720，用户设置里可能还留着越界值；这里就地夹回画布范围。
-        self.settings.caption_bar_width = self.settings.caption_bar_width.clamp(360, 1128);
+        self.settings.caption_bar_width = self.settings.caption_bar_width.clamp(360, 2536);
         let target = self.settings.caption_target_lang.clone();
         let lang = self.settings.caption_lang.clone();
         // 源语言和目标语言相同时翻译没有意义（NLLB 会给出另一句中文），
@@ -752,7 +752,7 @@ impl App {
             if self.settings.caption_engine == 1 {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("岛宽度").size(11.0));
-                    ui.add(egui::Slider::new(&mut self.settings.caption_bar_width, 360..=1128).suffix(" px"));
+                    ui.add(egui::Slider::new(&mut self.settings.caption_bar_width, 360..=(self.screen_w as u16 - 24).max(360)).suffix(" px"));
                 });
             }
         ui.add_space(6.0);
@@ -893,5 +893,7 @@ mod tests {
         }
     }
 }
+
+
 
 
