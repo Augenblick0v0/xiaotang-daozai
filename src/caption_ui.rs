@@ -396,11 +396,21 @@ impl App {
                 );
                 inner.centered_text(lx + chip_w / 2.0, 72.0, name, 9.5, W::Regular, if on { theme::WHITE } else { theme::DIM }, H::Center);
                 if hit.clicked() {
+                    // 只记语言，不偷偷换引擎：换引擎要重载 Whisper，用户会看到
+                    // 原生字幕窗口闪一下再卡在「启动中」十几秒。
                     self.settings.caption_lang = code.to_string();
-                    self.settings.caption_engine = 0;
-                    self.caption_notice = Some((format!("已切到本机识别：{name}"), std::time::Instant::now()));
+                    self.caption_notice = Some((format!("已设为本机识别语言：{name}（切到本机识别后生效）"), std::time::Instant::now()));
                 }
                 lx += chip_w + 4.0;
+            }
+            let (hit, inner) = crate::paint::capsule(
+                c, 282.0, 62.0, 112.0, 20.0, "cap-engine-whisper",
+                Color32::from_white_alpha(10), Color32::from_white_alpha(20),
+            );
+            inner.centered_text(338.0, 72.0, "切到本机识别", 9.5, W::Regular, theme::DIM, H::Center);
+            if hit.clicked() {
+                self.settings.caption_engine = 0;
+                self.caption_notice = Some(("正在切到本机识别…".to_string(), std::time::Instant::now()));
             }
         } else {
             // 第二行：识别语言。固定语言比 auto 稳：auto 会把中文听成日文。

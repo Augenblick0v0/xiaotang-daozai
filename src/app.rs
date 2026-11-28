@@ -3183,14 +3183,22 @@ impl App {
                 for item in items {
                     let item = item.trim();
                     if item.is_empty() || out.ends_with(item) { continue; }
-                    if !out.is_empty() && !out.ends_with([' ', '，', '。', '！', '？', ',', '.', '!', '?']) {
+                    // 英文句子之间必须有空格：只按「上一个字符是不是标点」判断会
+                    // 得到 "do.but" 这种粘连（标点本身就属于上一句）。
+                    let last = out.chars().last();
+                    let first = item.chars().next();
+                    let ascii_boundary = last.is_some_and(|c| c.is_ascii()) && first.is_some_and(|c| c.is_ascii());
+                    let needs_space = last.is_some_and(|c| c.is_whitespace() || matches!(c, '，' | '。' | '！' | '？' | '、' | '；' | '：'));
+                    if !out.is_empty() && !needs_space && ascii_boundary {
                         out.push(' ');
                     }
                     out.push_str(item);
                 }
                 out
             };
-            let tail: Vec<&crate::caption::Line> = recent.iter().rev().take(4).rev().copied().collect();
+            // 只取最新一句：把最近四句拼成一段再截最后两行，永远只能看到尾巴，
+            // 用户会觉得「实时字幕显示全了，岛上却没显示全」。
+            let tail: Vec<&crate::caption::Line> = recent.iter().rev().take(1).rev().copied().collect();
             let original = join(tail.iter().map(|line| line.text.as_str()).collect());
             let translated = join(tail.iter().map(|line| line.translation.as_str()).filter(|t| !t.trim().is_empty()).collect());
             // 只在「换句」时做一次上滑；同一句还在增长时不要每帧重置动画。
@@ -3231,8 +3239,19 @@ impl App {
                         // 估算宽度即可：每字符跑一次 text_w 会在长句上明显拖慢悬停动画。
                         let w = if ch.is_ascii() { size * 0.56 } else { size };
                         if used + w > avail && !current.is_empty() {
-                            lines.push(std::mem::take(&mut current));
-                            used = 0.0;
+                            // 英文按词换行：逐字硬切会把 "wish / we" 拆成孤零零的一行。
+                            if ch.is_ascii() && !ch.is_whitespace() {
+                                if let Some(space) = current.rfind(' ') {
+                                    let rest = current.split_off(space + 1);
+                                    lines.push(std::mem::take(&mut current));
+                                    current = rest;
+                                } else {
+                                    lines.push(std::mem::take(&mut current));
+                                }
+                            } else {
+                                lines.push(std::mem::take(&mut current));
+                            }
+                            used = current.chars().map(|c| if c.is_ascii() { size * 0.56 } else { size }).sum();
                         }
                         current.push(ch);
                         used += w;

@@ -35,7 +35,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 #[cfg(windows)]
-use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
 #[cfg(windows)]
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Children, TreeScope_Descendants,
@@ -45,7 +45,7 @@ use windows::Win32::UI::Accessibility::{
 use windows::Win32::Foundation::{BOOL, LPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SetWindowDisplayAffinity,
     GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_RESTORE, SW_SHOWNOACTIVATE, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
 };
 
@@ -157,7 +157,9 @@ impl LiveCaptions {
         // 恢复窗口只留给用户显式点「显示系统窗口」（show_window）。
         // 即使这个实例不是我们拉起的（复用了系统已在跑的 LiveCaptions），
         // 也要在停止后按回透明，否则它会一直停在屏幕上。
-        hide_all_live_captions();
+        // 用户点「停止」时要求连窗口一起消失：LiveCaptions 只是取字的后台进程，
+        // 留着它只会继续占麦克风、继续在屏幕上闪。复用的系统实例也一起结束。
+        kill_all_live_captions();
         self.hwnd.store(0, Ordering::SeqCst);
     }
 
@@ -671,6 +673,33 @@ fn hide_pid_windows(pid: u32) {
 }
 
 #[cfg(windows)]
+fn kill_all_live_captions() {
+    let mut pids: Vec<u32> = Vec::new();
+    unsafe extern "system" fn visit(hwnd: HWND, param: LPARAM) -> BOOL {
+        let pids = &mut *(param.0 as *mut Vec<u32>);
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != 0 && process_is_live_captions(pid) && !pids.contains(&pid) {
+            pids.push(pid);
+        }
+        BOOL(1)
+    }
+    unsafe { let _ = EnumWindows(Some(visit), LPARAM(&mut pids as *mut Vec<u32> as isize)); }
+    // 没有窗口的残留进程也一并结束（启动失败时窗口可能还没建出来）。
+    if let Some(pid) = find_live_captions_pid() {
+        if !pids.contains(&pid) { pids.push(pid); }
+    }
+    for pid in pids {
+        unsafe {
+            if let Ok(process) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                let _ = TerminateProcess(process, 1);
+                let _ = CloseHandle(process);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
 unsafe fn hide_window(hwnd: HWND) {
     let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
     let toolwindow = WS_EX_TOOLWINDOW.0 as i32;
@@ -681,6 +710,9 @@ unsafe fn hide_window(hwnd: HWND) {
     let _ = SetWindowDisplayAffinity(hwnd, windows::Win32::UI::WindowsAndMessaging::WINDOW_DISPLAY_AFFINITY(0x11) /* WDA_EXCLUDEFROMCAPTURE */);
     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 0, LWA_ALPHA);
+    // WinUI 3 的 DirectComposition 忽略分层 alpha（截图/用户桌面仍能看到整块字幕），
+    // DWM cloak 跨进程会被拒绝（E_ACCESSDENIED），所以只能把窗口挪到屏幕外。
+    let _ = SetWindowPos(hwnd, None, -12000, -12000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
 }
 
 /// 取消隐藏：恢复不透明、去掉工具窗口样式并还原窗口。
@@ -693,7 +725,7 @@ unsafe fn restore_window(hwnd: HWND) {
         SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !toolwindow);
     }
     let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 255, LWA_ALPHA);
-    let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    let _ = SetWindowPos(hwnd, None, 80, 80, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 }
 

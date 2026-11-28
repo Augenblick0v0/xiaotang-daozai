@@ -372,6 +372,16 @@ fn run_live(
         }
     };
 
+    // 订阅已经建立，先把状态置为运行中：翻译侧车（本机 NLLB）加载十几秒，
+    // 不能让它把「系统字幕已经在出字」的状态卡在「启动中」。
+    publish(&shared, |view| {
+        view.status = Status::Running;
+        view.stage.clear();
+        view.device = "系统".into();
+        view.model = "实时字幕".into();
+        view.translate = cfg.translate;
+    });
+
     // 翻译服务：translate-only 侧车。翻译模型加载慢，先起在后台，字幕照常出。
     let mut sidecar: Option<crate::caption_runtime::Sidecar> = None;
     let mut jobs: Option<mpsc::Sender<(String, String, String)>> = None;
@@ -470,13 +480,17 @@ fn run_live(
                 }
                 let (id, text, src) = job;
                 match translate_remote(backend, &url, &key, &model, &text, &src, &target) {
-                    Ok(translated) => publish(&tr_shared, |view| {
-                        if let Some(line) = view.history.iter_mut().rev().find(|line| line.id == id)
-                        {
-                            line.translation = translated;
+                    Ok(translated) => {
+                        if !translated.trim().is_empty() {
+                            publish(&tr_shared, |view| {
+                                if let Some(line) = view.history.iter_mut().rev().find(|line| line.id == id)
+                                {
+                                    line.translation = translated;
+                                }
+                                view.translate_error.clear();
+                            });
                         }
-                        view.translate_error.clear();
-                    }),
+                    }
                     Err(error) => publish(&tr_shared, |view| view.translate_error = error),
                 }
             }
@@ -494,12 +508,20 @@ fn run_live(
     });
 
     let mut last_text = String::new();
+    // 定稿句先压 0.9 秒再翻译：Live Captions 的 Current.Name 是累计快照，
+    // 一句话刚出现句号时下一拍还可能继续长（专有名词、补充从句），立刻提交会
+    // 把半句送去翻译，云端对超短/半句常返回空内容，就成了「接口返回了空译文」。
+    let mut pending_translation: Option<(String, String, String, Instant)> = None;
     // 还在增长的那半句只有一条：快照每来一次就更新它，不能每来一次就多一行。
     // 会话前缀必须唯一：live-part-1 这种短 id 跨会话会撞车，命中上一场的历史行后
     // 新句会被写到 session_start 之前，岛上永远只看到「正在听…」。
     let session = format!("{:08x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) as u32);
     let mut open_id: Option<String> = None;
     let mut open_seq = 0usize;
+    // 系统字幕的「定稿句」还会继续长：同一句从 "It's not something" 长到
+    // "It's not something that you say every day..."。如果每长一次就换一个 hash id，
+    // 记录里会出现好几条前缀重复的句子。这里让增长中的同一句复用 id。
+    let mut last_final: Option<(String, String)> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -527,6 +549,9 @@ fn run_live(
                     let count = sentences.len();
                     for (position, sentence) in sentences.into_iter().enumerate() {
                         let last = position + 1 == count;
+                        let grew_from_previous = last_final
+                            .as_ref()
+                            .is_some_and(|(_, previous)| sentence.text.starts_with(previous.trim()) && sentence.text.trim().len() > previous.trim().len());
                         let id = if last && !sentence.final_ {
                             if open_id.is_none() {
                                 open_seq += 1;
@@ -534,7 +559,8 @@ fn run_live(
                             }
                             open_id.clone().unwrap_or_default()
                         } else if last && sentence.final_ {
-                            open_id.take().unwrap_or_else(|| format!("live-{session}-{:08x}", fnv1a(&sentence.text)))
+                            let reused = last_final.as_ref().filter(|(_, previous)| sentence.text.trim() == previous.trim() || grew_from_previous).map(|(id, _)| id.clone());
+                            reused.unwrap_or_else(|| open_id.take().unwrap_or_else(|| format!("live-{session}-{:08x}", fnv1a(&sentence.text))))
                         } else {
                             format!("live-{session}-{:08x}", fnv1a(&sentence.text))
                         };
@@ -567,10 +593,13 @@ fn run_live(
                             let existing = view.history.iter().position(|line| line.id == id);
                             let mut line = existing.map(|index| view.history.remove(index)).unwrap_or_default();
                             line.id = id.clone();
+                            if line.text.trim() != sentence.text.trim() {
+                                // 文本变了，旧译文必然对不上，先清掉等重译。
+                                line.translation.clear();
+                            }
                             line.text = sentence.text.clone();
                             line.done = sentence.final_;
                             line.lang = lang.clone();
-                            if !sentence.final_ { line.translation.clear(); }
                             view.history.push(line);
                             view.lines =
                                 view.history.iter().rev().take(6).rev().cloned().collect();
@@ -583,11 +612,13 @@ fn run_live(
                                 sentence.text.clone()
                             };
                         });
-                        if sentence.final_ && !existed_done {
-                            if let Some(jobs) = &jobs {
-                                if cfg.translate && !same_language(&lang, &cfg.target) {
-                                    let _ = jobs.send((id, sentence.text.clone(), lang));
-                                }
+                        if sentence.final_ {
+                            last_final = Some((id.clone(), sentence.text.clone()));
+                        }
+                        if sentence.final_ && !existed_done && cfg.translate && !same_language(&lang, &cfg.target) {
+                            let text = sentence.text.trim().to_string();
+                            if text.chars().count() >= 4 {
+                                pending_translation = Some((id, text, lang, Instant::now()));
                             }
                         }
                     }
@@ -606,6 +637,21 @@ fn run_live(
                         view.stage = format!("系统实时字幕：{error}");
                     });
                 }
+            }
+        }
+        // 稳定 0.9 秒、且记录里的文本没有再增长，才真正送去翻译。
+        if let Some((id, text, lang, at)) = pending_translation.clone() {
+            if at.elapsed() >= Duration::from_millis(900) {
+                let stable = shared
+                    .lock()
+                    .map(|shared| shared.view.history.iter().rev().any(|line| line.id == id && line.text.trim() == text))
+                    .unwrap_or(false);
+                if stable {
+                    if let Some(jobs) = &jobs {
+                        let _ = jobs.send((id, text, lang));
+                    }
+                }
+                pending_translation = None;
             }
         }
         let _ = changed;
@@ -1065,7 +1111,42 @@ pub fn translate_remote(
     if !saw_json {
         return Err(format!("接口没有返回 JSON：{}", raw.trim().chars().take(160).collect::<String>()));
     }
-    if out.is_empty() { Err("接口返回了空译文".into()) } else { Ok(out) }
+    if !out.is_empty() {
+        return Ok(out);
+    }
+    // 有些兼容服务对很短的流式请求只发 role 帧、不发 content（或直接忽略 stream）。
+    // 再用非流式补一次，仍然空就把空串交给调用方静默跳过，别把「空译文」当错误弹给用户。
+    let body = serde_json::json!({
+        "model": model,
+        "temperature": 0.2,
+        "stream": false,
+        "messages": [
+            {"role": "system", "content": format!("Translate the user's text from {src} to {tgt}. Reply with the translation only, no quotes, no explanation.")},
+            {"role": "user", "content": text}
+        ]
+    })
+    .to_string();
+    let mut request = ureq::post(&url)
+        .timeout(Duration::from_secs(20))
+        .set("Content-Type", "application/json");
+    if !key.trim().is_empty() {
+        request = request.set("Authorization", &format!("Bearer {}", key.trim()));
+    }
+    match request.send_string(&body) {
+        Ok(response) => {
+            let raw = response.into_string().unwrap_or_default();
+            let value = serde_json::from_str::<serde_json::Value>(&raw).ok();
+            let text = value
+                .as_ref()
+                .and_then(|value| value.pointer("/choices/0/message/content"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            Ok(text)
+        }
+        Err(_) => Ok(String::new()),
+    }
 }
 
 fn publish(shared: &Arc<Mutex<Shared>>, edit: impl FnOnce(&mut View)) {
