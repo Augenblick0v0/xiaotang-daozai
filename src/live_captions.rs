@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use windows::core::VARIANT;
+use windows::core::w;
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
+};
 #[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, HWND, RECT, RPC_E_CHANGED_MODE};
 #[cfg(windows)]
@@ -702,6 +706,47 @@ fn hide_pid_windows(pid: u32) {
 }
 
 #[cfg(windows)]
+/// Set the language used by the Windows Live Captions engine.
+///
+/// The window exposes no automation API for this (its settings flyout is
+/// custom drawn), but the engine persists the choice in the per-user registry
+/// and re-reads it when the process starts.  Writing the value and restarting
+/// the process is therefore the supported way to make the switch take effect.
+pub fn set_caption_language(code: &str) -> Result<(), String> {
+    let tag = match code {
+        "zh" => "zh-CN",
+        "en" => "en-US",
+        "ja" => "ja-JP",
+        "ko" => "ko-KR",
+        other => return Err(format!("系统实时字幕不支持的语言：{other}")),
+    };
+    unsafe {
+        let mut key = HKEY::default();
+        let open = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\LiveCaptions\\UI"),
+            0,
+            KEY_SET_VALUE,
+            &mut key,
+        );
+        if open.is_err() {
+            return Err(format!("无法打开实时字幕设置：{}", open.0));
+        }
+        let mut wide: Vec<u16> = tag.encode_utf16().collect();
+        wide.push(0);
+        let bytes = std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
+        let set = RegSetValueExW(key, w!("CaptionLanguage"), 0, REG_SZ, Some(bytes));
+        let _ = RegCloseKey(key);
+        if set.is_err() {
+            return Err(format!("无法写入实时字幕语言：{}", set.0));
+        }
+    }
+    // Live Captions only reads the value at start-up, so restart it.  Our
+    // worker notices the exited process and relaunches it within two seconds.
+    kill_all_live_captions();
+    Ok(())
+}
+
 fn kill_all_live_captions() {
     let mut pids: Vec<u32> = Vec::new();
     unsafe extern "system" fn visit(hwnd: HWND, param: LPARAM) -> BOOL {
@@ -799,3 +844,5 @@ mod tests {
         assert!(!sentences[2].final_, "末尾无标点的残留必须是 final=false");
     }
 }
+
+

@@ -400,6 +400,10 @@ impl App {
             c.text(15.0, 76.0, "识别", 9.5, W::Regular, theme::DIM, H::Left);
             let mut lx = 38.0;
             for (code, name, chip_w) in LANGS {
+                // 混合语言不是一个合法的系统字幕语言，系统模式下不显示。
+                if code == "mixed" {
+                    continue;
+                }
                 let on = self.settings.caption_lang == code;
                 let (hit, inner) = crate::paint::capsule(
                     c, lx, 62.0, chip_w, 20.0, &format!("cap-lang-{code}"),
@@ -408,12 +412,12 @@ impl App {
                 );
                 inner.centered_text(lx + chip_w / 2.0, 72.0, name, 9.5, W::Regular, if on { theme::WHITE } else { theme::DIM }, H::Center);
                 if hit.clicked() {
-                    // 系统实时字幕不接受外部语言参数，只有 Windows 自己的设置能改；
-                    // 所以点语言必须真的换引擎，否则就是「点了没反应」。
+                    // 系统实时字幕的语言存在 HKCU 里，改完重启它的进程即可生效。
                     self.settings.caption_lang = code.to_string();
-                    self.settings.caption_engine = 0;
-                    self.caption_notice = Some((format!("正在切到本机识别：{name}…"), std::time::Instant::now()));
-                    changed = true;
+                    match crate::live_captions::set_caption_language(code) {
+                        Ok(()) => self.caption_notice = Some((format!("系统实时字幕语言已切换为 {name}…"), std::time::Instant::now())),
+                        Err(error) => self.caption_notice = Some((error, std::time::Instant::now())),
+                    }
                 }
                 lx += chip_w + 4.0;
             }
