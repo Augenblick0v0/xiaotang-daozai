@@ -3198,7 +3198,9 @@ impl App {
             };
             // 只取最新一句：把最近四句拼成一段再截最后两行，永远只能看到尾巴，
             // 用户会觉得「实时字幕显示全了，岛上却没显示全」。
-            let tail: Vec<&crate::caption::Line> = recent.iter().rev().take(1).rev().copied().collect();
+            // 同时保留上一句：上一句的译文常常比下一句晚到，只画最后一句会让
+            // 它刚翻好就随下一句跳走，看起来像「没翻完就跳了」。
+            let tail: Vec<&crate::caption::Line> = recent.iter().rev().take(2).rev().copied().collect();
             let original = join(tail.iter().map(|line| line.text.as_str()).collect());
             let translated = join(tail.iter().map(|line| line.translation.as_str()).filter(|t| !t.trim().is_empty()).collect());
             // 只在「换句」时做一次上滑；同一句还在增长时不要每帧重置动画。
