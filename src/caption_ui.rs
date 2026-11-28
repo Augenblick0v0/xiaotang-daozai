@@ -380,6 +380,18 @@ impl App {
             self.settings.caption_enabled = !running;
             changed = true;
         }
+        if self.settings.caption_engine == 1 {
+            // 放在第一行空白处：第二行左边是语言胶囊、右边是导出/清空，挤在一起会叠字。
+            let (hit, inner) = crate::paint::capsule(
+                c, 208.0, 36.0, 138.0, 20.0, "cap-engine-whisper",
+                Color32::from_white_alpha(10), Color32::from_white_alpha(20),
+            );
+            inner.centered_text(277.0, 46.0, "切到本机识别", 9.5, W::Regular, theme::DIM, H::Center);
+            if hit.clicked() {
+                self.settings.caption_engine = 0;
+                self.caption_notice = Some(("正在切到本机识别…".to_string(), std::time::Instant::now()));
+            }
+        }
 
         if self.settings.caption_engine == 1 {
             // 系统实时字幕本身不接受语言参数；这里保留识别语言这一行，
@@ -402,15 +414,6 @@ impl App {
                     self.caption_notice = Some((format!("已设为本机识别语言：{name}（切到本机识别后生效）"), std::time::Instant::now()));
                 }
                 lx += chip_w + 4.0;
-            }
-            let (hit, inner) = crate::paint::capsule(
-                c, 282.0, 62.0, 112.0, 20.0, "cap-engine-whisper",
-                Color32::from_white_alpha(10), Color32::from_white_alpha(20),
-            );
-            inner.centered_text(338.0, 72.0, "切到本机识别", 9.5, W::Regular, theme::DIM, H::Center);
-            if hit.clicked() {
-                self.settings.caption_engine = 0;
-                self.caption_notice = Some(("正在切到本机识别…".to_string(), std::time::Instant::now()));
             }
         } else {
             // 第二行：识别语言。固定语言比 auto 稳：auto 会把中文听成日文。
