@@ -511,7 +511,7 @@ fn run_live(
     // 定稿句先压 0.9 秒再翻译：Live Captions 的 Current.Name 是累计快照，
     // 一句话刚出现句号时下一拍还可能继续长（专有名词、补充从句），立刻提交会
     // 把半句送去翻译，云端对超短/半句常返回空内容，就成了「接口返回了空译文」。
-    let mut pending_translation: Option<(String, String, String, Instant)> = None;
+    let mut pending_translation: Option<(String, String, String, Instant, Instant)> = None;
     // 还在增长的那半句只有一条：快照每来一次就更新它，不能每来一次就多一行。
     // 会话前缀必须唯一：live-part-1 这种短 id 跨会话会撞车，命中上一场的历史行后
     // 新句会被写到 session_start 之前，岛上永远只看到「正在听…」。
@@ -615,10 +615,23 @@ fn run_live(
                         if sentence.final_ {
                             last_final = Some((id.clone(), sentence.text.clone()));
                         }
-                        if sentence.final_ && !existed_done && cfg.translate && !same_language(&lang, &cfg.target) {
+                        // 系统实时字幕经常不带标点，句子永远等不到 final_；这里不再
+                        // 依赖句号，而是「文本静下来 0.9 秒」或「同一句已说满 3.5 秒」
+                        // 就送翻译，否则会一直卡在「翻译中…」。
+                        if !existed_done && cfg.translate && !same_language(&lang, &cfg.target) {
                             let text = sentence.text.trim().to_string();
                             if text.chars().count() >= 4 {
-                                pending_translation = Some((id, text, lang, Instant::now()));
+                                match &mut pending_translation {
+                                    Some((pid, ptext, _, _, last)) if *pid == id => {
+                                        if ptext != &text {
+                                            *ptext = text;
+                                            *last = Instant::now();
+                                        }
+                                    }
+                                    _ => {
+                                        pending_translation = Some((id, text, lang, Instant::now(), Instant::now()));
+                                    }
+                                }
                             }
                         }
                     }
@@ -640,13 +653,15 @@ fn run_live(
             }
         }
         // 稳定 0.9 秒、且记录里的文本没有再增长，才真正送去翻译。
-        if let Some((id, text, lang, at)) = pending_translation.clone() {
-            if at.elapsed() >= Duration::from_millis(900) {
+        if let Some((id, text, lang, first, last)) = pending_translation.clone() {
+            let quiet = last.elapsed() >= Duration::from_millis(900);
+            let too_long = first.elapsed() >= Duration::from_millis(3500);
+            if quiet || too_long {
                 let stable = shared
                     .lock()
                     .map(|shared| shared.view.history.iter().rev().any(|line| line.id == id && line.text.trim() == text))
                     .unwrap_or(false);
-                if stable {
+                if stable || too_long {
                     if let Some(jobs) = &jobs {
                         let _ = jobs.send((id, text, lang));
                     }
