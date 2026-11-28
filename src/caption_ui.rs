@@ -654,6 +654,7 @@ impl App {
             setting_row(ui, "显示未定稿的半句", "把还在识别中的那半句用浅色显示出来", &mut self.settings.caption_show_partial);
             ui.separator();
             setting_row(ui, "收起时在岛上显示", "岛收起成药丸时，在角标位置滚动显示最近一句", &mut self.settings.caption_on_island);
+            setting_row(ui, "跟随自动避让", "被前台应用遮住时，字幕区也一起收成细线", &mut self.settings.caption_avoid);
         });
         settings_label(ui, "翻译");
         settings_card(ui, |ui| {

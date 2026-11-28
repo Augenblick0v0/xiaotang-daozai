@@ -1842,6 +1842,7 @@ impl App {
         let view=self.caption.island();
         let visible=self.settings.caption_on_island
             && !self.open
+            && !(self.browser_minimal_active && self.settings.caption_avoid)
             && matches!(view.status,crate::caption::Status::Running|crate::caption::Status::Starting);
         if let Ok(path)=std::env::var("DAOZAI_CAPTION_DEBUG") {
             use std::sync::atomic::{AtomicU64,Ordering};
@@ -3237,15 +3238,17 @@ impl App {
                 };
                 let orig_rows = wrap(&original, 12.0, W::Semibold);
                 let orig: Vec<String> = orig_rows.iter().rev().take(2).rev().cloned().collect();
-                let mut y = 17.0f32;
+                let tr_rows = if view.translate { wrap(&translated, 11.0, W::Regular) } else { Vec::new() };
+                let tr: Vec<String> = tr_rows.iter().rev().take(2).rev().cloned().collect();
+                // 整块垂直居中：两行时不要贴着岛顶，四行时也别压到圆角。
+                let block = (orig.len() + tr.len()).max(1);
+                let mut y = (self.caption_bar_height() - (block as f32 - 1.0) * 17.0) / 2.0 + 6.0;
                 if orig.is_empty() {
                     c.text(x, 26.0, "正在听…", 12.0, W::Regular, theme::DIM, H::Left);
                 } else {
                     for line in &orig { row(line, 12.0, W::Semibold, theme::WHITE, &mut y); }
                 }
                 if view.translate {
-                    let tr_rows = wrap(&translated, 11.0, W::Regular);
-                    let tr: Vec<String> = tr_rows.iter().rev().take(2).rev().cloned().collect();
                     if tr.is_empty() {
                         if !original.trim().is_empty() {
                             c.text(x, y + 11.0 + slide, "翻译中…", 10.5, W::Regular, theme::DIM, H::Left);

@@ -42,7 +42,8 @@ use windows::Win32::UI::Accessibility::{
     UIA_AutomationIdPropertyId, UIA_ProcessIdPropertyId, UIA_E_ELEMENTNOTAVAILABLE,
 };
 #[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity,
+use windows::Win32::Foundation::{BOOL, LPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SetWindowDisplayAffinity,
     GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SW_RESTORE, SW_SHOWNOACTIVATE, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
@@ -105,7 +106,13 @@ impl LiveCaptions {
                 let child = Command::new(LIVE_CAPTIONS_EXE)
                     .spawn()
                     .map_err(|err| format!("启动 LiveCaptions 失败：{err}"))?;
-                (child.id(), Some(child))
+                let pid = child.id();
+                // 抢在窗口绘制前按掉：Live Captions 是 WinUI 应用，窗口晚于进程出现。
+                for _ in 0..50 {
+                    hide_pid_windows(pid);
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+                (pid, Some(child))
             }
         };
 
@@ -613,6 +620,26 @@ fn is_process_alive(pid: u32) -> bool {
 /// 用分层窗口把 alpha 降到 0，窗口仍在正常渲染，UI Automation 的文本才会持续更新；
 /// 最小化在 Win11 上会把它缩成左下角一块可见的卡片，用户能直接拉出来。
 #[cfg(windows)]
+/// 把指定进程的所有可见顶层窗口压成透明工具窗。
+///
+/// 只在 UIA 找到 CaptionsTextBlock 之后才隐藏是不够的：Live Captions 的窗口
+/// 通常比 UIA 元素先出现，用户会看到它闪一下甚至停留。这里按 PID 枚举窗口，
+/// 启动后 1.5 秒内每 30ms 扫一次，尽量在它画出来之前就按掉。
+#[cfg(windows)]
+fn hide_pid_windows(pid: u32) {
+    unsafe extern "system" fn visit(hwnd: HWND, param: LPARAM) -> BOOL {
+        let pid = param.0 as u32;
+        let mut owner = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut owner));
+        if owner == pid && IsWindowVisible(hwnd).as_bool() {
+            hide_window(hwnd);
+        }
+        BOOL(1)
+    }
+    unsafe { let _ = EnumWindows(Some(visit), LPARAM(pid as isize)); }
+}
+
+#[cfg(windows)]
 unsafe fn hide_window(hwnd: HWND) {
     let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
     let toolwindow = WS_EX_TOOLWINDOW.0 as i32;
@@ -620,6 +647,7 @@ unsafe fn hide_window(hwnd: HWND) {
     if ex_style & (toolwindow | layered) != (toolwindow | layered) {
         SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | toolwindow | layered);
     }
+    let _ = SetWindowDisplayAffinity(hwnd, windows::Win32::UI::WindowsAndMessaging::WINDOW_DISPLAY_AFFINITY(0x11) /* WDA_EXCLUDEFROMCAPTURE */);
     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 0, LWA_ALPHA);
 }
