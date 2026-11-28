@@ -156,20 +156,25 @@ impl App {
             api_key: self.settings.caption_api_key.clone(),
             api_model: self.settings.caption_api_model.clone(),
         };
+        // 系统实时字幕（engine=1）不归我们重启：目标语言、翻译开关都能在
+        // 运行中的线程里改。否则每动一下设置就会杀掉 LiveCaptions 再拉起，
+        // 用户会看到原生字幕窗口闪一下。只有换引擎才需要重启。
+        let live = cfg.engine == 1;
         let changed = self.caption_cfg.as_ref().is_some_and(|old| {
             old.engine != cfg.engine
-                || old.source != cfg.source
-                || old.lang != cfg.lang
-                || old.translate != cfg.translate
-                || old.target != cfg.target
-                || old.python != cfg.python
-                || old.model != cfg.model
-                || old.force_cpu != cfg.force_cpu
-                || old.beam != cfg.beam
-                || old.translate_backend != cfg.translate_backend
-                || old.api_url != cfg.api_url
-                || old.api_key != cfg.api_key
-                || old.api_model != cfg.api_model
+                || (!live
+                    && (old.source != cfg.source
+                        || old.lang != cfg.lang
+                        || old.translate != cfg.translate
+                        || old.target != cfg.target
+                        || old.python != cfg.python
+                        || old.model != cfg.model
+                        || old.force_cpu != cfg.force_cpu
+                        || old.beam != cfg.beam
+                        || old.translate_backend != cfg.translate_backend
+                        || old.api_url != cfg.api_url
+                        || old.api_key != cfg.api_key
+                        || old.api_model != cfg.api_model))
         });
         if !self.caption.active() {
             // 只在「还没起过」时拉起一次。线程挂了（侧车报错、端口冲突）就停在
@@ -181,6 +186,11 @@ impl App {
         } else if changed {
             self.caption.stop();
             self.caption.start(cfg.clone());
+            self.caption_cfg = Some(cfg.clone());
+        } else if let Some(old) = self.caption_cfg.clone() {
+            if live && (old.translate != cfg.translate || old.target != cfg.target) {
+                self.caption.set_translation(cfg.translate, &cfg.target);
+            }
             self.caption_cfg = Some(cfg.clone());
         }
         // 安装完成后自动接着启动（用户刚装完不该再点一次）。
@@ -294,8 +304,26 @@ impl App {
         }
 
         if self.settings.caption_engine == 1 {
-            // 系统实时字幕的语言在它自己的设置里选，这里只提示，不做假开关。
-            c.text(15.0, 76.0, "语言由系统「实时字幕」设置决定", 9.5, W::Regular, theme::DIM, H::Left);
+            // 系统实时字幕本身不接受语言参数；这里保留识别语言这一行，
+            // 点任意语言就切到本机 Whisper（它才真能锁定识别语言），
+            // 点「系统」则切回系统实时字幕。这样不用进设置页也能改。
+            c.text(15.0, 76.0, "识别", 9.5, W::Regular, theme::DIM, H::Left);
+            let mut lx = 38.0;
+            for (code, name, chip_w) in LANGS {
+                let on = self.settings.caption_lang == code;
+                let (hit, inner) = crate::paint::capsule(
+                    c, lx, 62.0, chip_w, 20.0, &format!("cap-lang-{code}"),
+                    if on { theme::CYAN.linear_multiply(0.32) } else { Color32::from_white_alpha(10) },
+                    if on { theme::CYAN.linear_multiply(0.42) } else { Color32::from_white_alpha(20) },
+                );
+                inner.centered_text(lx + chip_w / 2.0, 72.0, name, 9.5, W::Regular, if on { theme::WHITE } else { theme::DIM }, H::Center);
+                if hit.clicked() {
+                    self.settings.caption_lang = code.to_string();
+                    self.settings.caption_engine = 0;
+                    self.caption_notice = Some((format!("已切到本机识别：{name}"), std::time::Instant::now()));
+                }
+                lx += chip_w + 4.0;
+            }
         } else {
             // 第二行：识别语言。固定语言比 auto 稳：auto 会把中文听成日文。
             c.text(15.0, 76.0, "识别", 9.5, W::Regular, theme::DIM, H::Left);
