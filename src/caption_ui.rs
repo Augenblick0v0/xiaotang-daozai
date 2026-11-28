@@ -408,10 +408,12 @@ impl App {
                 );
                 inner.centered_text(lx + chip_w / 2.0, 72.0, name, 9.5, W::Regular, if on { theme::WHITE } else { theme::DIM }, H::Center);
                 if hit.clicked() {
-                    // 只记语言，不偷偷换引擎：换引擎要重载 Whisper，用户会看到
-                    // 原生字幕窗口闪一下再卡在「启动中」十几秒。
+                    // 系统实时字幕不接受外部语言参数，只有 Windows 自己的设置能改；
+                    // 所以点语言必须真的换引擎，否则就是「点了没反应」。
                     self.settings.caption_lang = code.to_string();
-                    self.caption_notice = Some((format!("已设为本机识别语言：{name}（切到本机识别后生效）"), std::time::Instant::now()));
+                    self.settings.caption_engine = 0;
+                    self.caption_notice = Some((format!("正在切到本机识别：{name}…"), std::time::Instant::now()));
+                    changed = true;
                 }
                 lx += chip_w + 4.0;
             }
