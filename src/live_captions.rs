@@ -35,7 +35,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 #[cfg(windows)]
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
 #[cfg(windows)]
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Children, TreeScope_Descendants,
@@ -155,6 +155,9 @@ impl LiveCaptions {
         }
         // 停止字幕时不要把 LiveCaptions 窗口放出来：它只是取字用的后台进程。
         // 恢复窗口只留给用户显式点「显示系统窗口」（show_window）。
+        // 即使这个实例不是我们拉起的（复用了系统已在跑的 LiveCaptions），
+        // 也要在停止后按回透明，否则它会一直停在屏幕上。
+        hide_all_live_captions();
         self.hwnd.store(0, Ordering::SeqCst);
     }
 
@@ -397,6 +400,8 @@ impl Worker {
         }
 
         // 3. 找顶层窗口（root 的直接子元素，按进程号过滤）。
+        //    Live Captions 可能被系统重启成新进程/新窗口，每轮把所有实例压透明。
+        hide_all_live_captions();
         if self.window.is_none() {
             self.try_find_window();
             if self.window.is_none() {
@@ -625,6 +630,32 @@ fn is_process_alive(pid: u32) -> bool {
 /// 只在 UIA 找到 CaptionsTextBlock 之后才隐藏是不够的：Live Captions 的窗口
 /// 通常比 UIA 元素先出现，用户会看到它闪一下甚至停留。这里按 PID 枚举窗口，
 /// 启动后 1.5 秒内每 30ms 扫一次，尽量在它画出来之前就按掉。
+#[cfg(windows)]
+fn hide_all_live_captions() {
+    unsafe extern "system" fn visit(hwnd: HWND, _param: LPARAM) -> BOOL {
+        if !IsWindowVisible(hwnd).as_bool() { return BOOL(1); }
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != 0 && process_is_live_captions(pid) { hide_window(hwnd); }
+        BOOL(1)
+    }
+    unsafe { let _ = EnumWindows(Some(visit), LPARAM(0)); }
+}
+
+/// 系统可能把 Live Captions 重新拉到另一个进程里（切换语言/主题时会重建窗口），
+/// 只盯着记录的 pid 会漏掉新窗口。这里按进程可执行文件名判断，任何实例都压透明。
+#[cfg(windows)]
+fn process_is_live_captions(pid: u32) -> bool {
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return false; };
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = CloseHandle(process);
+        ok && String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase().ends_with("livecaptions.exe")
+    }
+}
+
 #[cfg(windows)]
 fn hide_pid_windows(pid: u32) {
     unsafe extern "system" fn visit(hwnd: HWND, param: LPARAM) -> BOOL {

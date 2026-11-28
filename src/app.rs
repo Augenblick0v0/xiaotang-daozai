@@ -962,6 +962,12 @@ pub struct App {
     pub(crate) caption_follow: bool,
     /// 开机自动开启字幕只做一次，之后尊重用户的手动开关。
     caption_boot: bool,
+    /// 云端翻译接口的模型列表（GET /models 的结果）。
+    pub(crate) caption_api_models: Vec<String>,
+    /// 云端接口测试/取模型的进行中状态与结果。
+    pub(crate) caption_api_busy: bool,
+    pub(crate) caption_api_status: Option<(String, bool, std::time::Instant)>,
+    pub(crate) caption_api_rx: Option<std::sync::mpsc::Receiver<Result<(Vec<String>, String), String>>>,
 }
 
 impl App {
@@ -1148,6 +1154,10 @@ impl App {
         caption_key: String::new(),
             caption_follow: true,
         caption_boot: false,
+        caption_api_models: Vec::new(),
+        caption_api_busy: false,
+        caption_api_status: None,
+        caption_api_rx: None,
         }
     }
 
@@ -3251,7 +3261,12 @@ impl App {
                 if view.translate {
                     if tr.is_empty() {
                         if !original.trim().is_empty() {
-                            c.text(x, y + 11.0 + slide, "翻译中…", 10.5, W::Regular, theme::DIM, H::Left);
+                            if view.translate_error.trim().is_empty() {
+                                c.text(x, y + 11.0 + slide, "翻译中…", 10.5, W::Regular, theme::DIM, H::Left);
+                            } else {
+                                let error = c.fit(&format!("翻译失败：{}", view.translate_error), 9.5, W::Regular, (right - x).max(80.0));
+                                c.text(x, y + 11.0 + slide, &error, 9.5, W::Regular, theme::RED, H::Left);
+                            }
                         }
                     } else {
                         for line in &tr { row(line, 11.0, W::Regular, theme::CYAN, &mut y); }

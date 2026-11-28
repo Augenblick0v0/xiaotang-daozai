@@ -116,7 +116,80 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// 用当前填写的地址/Key/模型发一个最小流式请求；可选顺便拉取模型列表。
+    pub(crate) fn caption_api_probe(&mut self, fetch_models: bool) {
+        if self.caption_api_busy { return; }
+        let base = self.settings.caption_api_url.trim().trim_end_matches('/').to_string();
+        let key = self.settings.caption_api_key.trim().to_string();
+        let model = self.settings.caption_api_model.trim().to_string();
+        if base.is_empty() { self.caption_api_status = Some(("接口地址为空".into(), false, std::time::Instant::now())); return; }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.caption_api_rx = Some(rx);
+        self.caption_api_busy = true;
+        std::thread::spawn(move || {
+            let mut models: Vec<String> = Vec::new();
+            if fetch_models {
+                let request = ureq::get(&format!("{base}/models")).timeout(std::time::Duration::from_secs(15));
+                let request = if key.is_empty() { request } else { request.set("Authorization", &format!("Bearer {key}")) };
+                match request.call() {
+                    Ok(response) => match response.into_string() {
+                        Ok(body) => {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+                                if let Some(items) = value.get("data").and_then(|v| v.as_array()) {
+                                    models = items.iter().filter_map(|item| item.get("id").and_then(|v| v.as_str()).map(str::to_string)).collect();
+                                }
+                            }
+                        }
+                        Err(err) => { let _ = tx.send(Err(format!("读取模型列表失败：{err}"))); return; }
+                    },
+                    Err(err) => { let _ = tx.send(Err(format!("获取模型列表失败：{err}"))); return; }
+                }
+            }
+            let body = serde_json::json!({
+                "model": model,
+                "stream": true,
+                "max_tokens": 8,
+                "messages": [{"role":"user","content":"Say OK"}]
+            }).to_string();
+            let request = ureq::post(&format!("{base}/chat/completions"))
+                .timeout(std::time::Duration::from_secs(30))
+                .set("Content-Type", "application/json")
+                .set("Accept", "text/event-stream");
+            let request = if key.is_empty() { request } else { request.set("Authorization", &format!("Bearer {key}")) };
+            let result = match request.send_string(&body) {
+                Ok(response) => match response.into_string() {
+                    Ok(raw) => {
+                        let streamed = raw.contains("data:") && raw.contains("\"content\"");
+                        let json_ok = serde_json::from_str::<serde_json::Value>(&raw).is_ok();
+                        if streamed || json_ok { Ok((models, "连接正常，模型可用".to_string())) }
+                        else { Err(format!("接口有响应但格式不对：{}", raw.trim().chars().take(120).collect::<String>())) }
+                    }
+                    Err(err) => Err(format!("读取响应失败：{err}")),
+                },
+                Err(ureq::Error::Status(status, response)) => {
+                    let detail = response.into_string().unwrap_or_default();
+                    Err(format!("接口返回 {status}：{}", detail.trim().chars().take(120).collect::<String>()))
+                }
+                Err(err) => Err(format!("连接失败：{err}")),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
     pub(crate) fn caption_tick(&mut self) {
+        if let Some(rx) = &self.caption_api_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.caption_api_rx = None;
+                self.caption_api_busy = false;
+                match result {
+                    Ok((models, message)) => {
+                        if !models.is_empty() { self.caption_api_models = models; }
+                        self.caption_api_status = Some((message, true, std::time::Instant::now()));
+                    }
+                    Err(error) => self.caption_api_status = Some((error, false, std::time::Instant::now())),
+                }
+            }
+        }
         // 设置里改了上限就立刻生效（改小会顺手裁掉最旧的）。
         let cap = (self.settings.caption_history_mb as usize).max(1) * 1024 * 1024;
         self.caption_history.set_cap_bytes(cap);
@@ -162,6 +235,11 @@ impl App {
         let live = cfg.engine == 1;
         let changed = self.caption_cfg.as_ref().is_some_and(|old| {
             old.engine != cfg.engine
+                || (live
+                    && (old.translate_backend != cfg.translate_backend
+                        || old.api_url != cfg.api_url
+                        || old.api_key != cfg.api_key
+                        || old.api_model != cfg.api_model))
                 || (!live
                     && (old.source != cfg.source
                         || old.lang != cfg.lang
@@ -713,9 +791,39 @@ impl App {
                 });
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("模型").size(11.0));
-                    ui.add(egui::TextEdit::singleline(&mut self.settings.caption_api_model).desired_width(220.0).hint_text("gpt-4o-mini"));
+                    if self.caption_api_models.is_empty() {
+                        ui.add(egui::TextEdit::singleline(&mut self.settings.caption_api_model).desired_width(220.0).hint_text("gpt-4o-mini"));
+                    } else {
+                        let mut selected = self.settings.caption_api_model.clone();
+                        egui::ComboBox::from_id_salt("caption-api-model")
+                            .width(220.0)
+                            .selected_text(if selected.is_empty() { "选择模型" } else { selected.as_str() })
+                            .show_ui(ui, |ui| {
+                                for model in &self.caption_api_models {
+                                    if ui.selectable_label(selected == *model, model).clicked() {
+                                        selected = model.clone();
+                                    }
+                                }
+                            });
+                        if selected != self.settings.caption_api_model { self.settings.caption_api_model = selected; }
+                    }
                 });
-                ui.label(egui::RichText::new("兼容 OpenAI /chat/completions 的服务都能填；Key 只存在本机设置文件里。").size(10.5).color(egui::Color32::from_gray(140)));
+                ui.horizontal(|ui| {
+                    let busy = self.caption_api_busy;
+                    if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(if busy { "测试中…" } else { "测试连接" }).size(11.0))).clicked() {
+                        self.caption_api_probe(false);
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("获取模型列表").size(11.0))).clicked() {
+                        self.caption_api_probe(true);
+                    }
+                    if let Some((message, ok, at)) = &self.caption_api_status {
+                        if at.elapsed().as_secs() < 30 {
+                            let color = if *ok { egui::Color32::from_rgb(120, 200, 140) } else { egui::Color32::from_rgb(220, 120, 120) };
+                            ui.label(egui::RichText::new(message).size(10.5).color(color));
+                        }
+                    }
+                });
+                ui.label(egui::RichText::new("兼容 OpenAI /chat/completions 的服务都能填；测试连接会用当前模型发一个最小流式请求，Key 只存在本机设置文件里。").size(10.5).color(egui::Color32::from_gray(140)));
             }
         });
         settings_label(ui, "记录");

@@ -47,6 +47,8 @@ pub struct IslandView {
     pub translate: bool,
     pub lang: String,
     pub target: String,
+    /// 最近一次云端翻译失败的原因；空表示没出错。
+    pub translate_error: String,
     /// 最近三句（按时间顺序），只用于拼滚动文本窗。
     pub lines: Vec<Line>,
 }
@@ -70,6 +72,8 @@ pub struct View {
     /// 还没定稿的那半句（侧车的 buffer_transcription）。
     pub partial: String,
     pub error: Option<String>,
+    /// 上一次云端翻译失败的原因；成功后清空。UI 用它替代一直转圈的「翻译中…」。
+    pub translate_error: String,
     pub translate: bool,
     pub target: String,
     /// 侧车自报的 device（cuda / cpu），给页面显示用。
@@ -166,6 +170,7 @@ impl Captions {
             translate: view.translate,
             lang: view.lang.clone(),
             target: view.target.clone(),
+            translate_error: view.translate_error.clone(),
             lines: recent,
         }
     }
@@ -464,15 +469,15 @@ fn run_live(
                     job = next;
                 }
                 let (id, text, src) = job;
-                if let Some(translated) =
-                    translate_remote(backend, &url, &key, &model, &text, &src, &target)
-                {
-                    publish(&tr_shared, |view| {
+                match translate_remote(backend, &url, &key, &model, &text, &src, &target) {
+                    Ok(translated) => publish(&tr_shared, |view| {
                         if let Some(line) = view.history.iter_mut().rev().find(|line| line.id == id)
                         {
                             line.translation = translated;
                         }
-                    });
+                        view.translate_error.clear();
+                    }),
+                    Err(error) => publish(&tr_shared, |view| view.translate_error = error),
                 }
             }
         }));
@@ -980,7 +985,7 @@ fn dedupe_history(history: &mut Vec<Line>, from: usize) {
 
 
 /// 云端翻译：不依赖本机 NLLB，适合本机速度跟不上时使用。
-fn translate_remote(
+pub fn translate_remote(
     backend: u8,
     base_url: &str,
     key: &str,
@@ -988,9 +993,9 @@ fn translate_remote(
     text: &str,
     src: &str,
     tgt: &str,
-) -> Option<String> {
+) -> Result<String, String> {
     if text.trim().is_empty() {
-        return None;
+        return Ok(String::new());
     }
     if backend == 1 {
         let url = format!(
@@ -1002,17 +1007,22 @@ fn translate_remote(
         let body = ureq::get(&url)
             .timeout(Duration::from_secs(12))
             .call()
-            .ok()?
+            .map_err(|err| format!("Google 翻译请求失败：{err}"))?
             .into_string()
-            .ok()?;
-        let value: serde_json::Value = serde_json::from_str(&body).ok()?;
-        let first = value.get(0)?.get(0)?.get(0)?.as_str()?.trim().to_string();
-        return (!first.is_empty()).then_some(first);
+            .map_err(|err| format!("Google 翻译读取失败：{err}"))?;
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|err| format!("Google 翻译返回格式不对：{err}"))?;
+        let first = value.get(0).and_then(|v| v.get(0)).and_then(|v| v.get(0)).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        return if first.is_empty() { Err("Google 翻译返回空结果".into()) } else { Ok(first) };
     }
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("接口地址为空".into());
+    }
+    let url = format!("{base}/chat/completions");
     let body = serde_json::json!({
         "model": model,
         "temperature": 0.2,
+        "stream": true,
         "messages": [
             {"role": "system", "content": format!("Translate the user's text from {src} to {tgt}. Reply with the translation only, no quotes, no explanation.")},
             {"role": "user", "content": text}
@@ -1020,24 +1030,43 @@ fn translate_remote(
     })
     .to_string();
     let mut request = ureq::post(&url)
-        .timeout(Duration::from_secs(20))
-        .set("Content-Type", "application/json");
+        .timeout(Duration::from_secs(30))
+        .set("Content-Type", "application/json")
+        .set("Accept", "text/event-stream");
     if !key.trim().is_empty() {
         request = request.set("Authorization", &format!("Bearer {}", key.trim()));
     }
-    let body = request.send_string(&body).ok()?.into_string().ok()?;
-    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let out = value
-        .get("choices")?
-        .get(0)?
-        .get("message")?
-        .get("content")?
-        .as_str()?
-        .trim()
-        .to_string();
-    (!out.is_empty()).then_some(out)
+    let response = match request.send_string(&body) {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => {
+            let detail = response.into_string().unwrap_or_default();
+            let detail = detail.trim();
+            return Err(format!("接口返回 {status}{}", if detail.is_empty() { String::new() } else { format!("：{}", detail.chars().take(160).collect::<String>()) }));
+        }
+        Err(err) => return Err(format!("请求接口失败：{err}")),
+    };
+    let raw = response.into_string().map_err(|err| format!("读取接口响应失败：{err}"))?;
+    // 流式响应是若干 data: {...} 行；有些兼容服务会忽略 stream 直接回整段 JSON。
+    let mut out = String::new();
+    let mut saw_json = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+        if payload.is_empty() || payload == "[DONE]" { continue; }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else { continue; };
+        saw_json = true;
+        if let Some(delta) = value.pointer("/choices/0/delta/content").and_then(|v| v.as_str()) {
+            out.push_str(delta);
+        } else if let Some(content) = value.pointer("/choices/0/message/content").and_then(|v| v.as_str()) {
+            out.push_str(content);
+        }
+    }
+    let out = out.trim().to_string();
+    if !saw_json {
+        return Err(format!("接口没有返回 JSON：{}", raw.trim().chars().take(160).collect::<String>()));
+    }
+    if out.is_empty() { Err("接口返回了空译文".into()) } else { Ok(out) }
 }
-
 
 fn publish(shared: &Arc<Mutex<Shared>>, edit: impl FnOnce(&mut View)) {
     if let Ok(mut shared) = shared.lock() {
