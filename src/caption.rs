@@ -594,8 +594,14 @@ fn run_live(
                             let mut line = existing.map(|index| view.history.remove(index)).unwrap_or_default();
                             line.id = id.clone();
                             if line.text.trim() != sentence.text.trim() {
-                                // 文本变了，旧译文必然对不上，先清掉等重译。
-                                line.translation.clear();
+                                // 句子还在增长时保留上一版译文，否则每多一个字就
+                                // 闪回「翻译中…」；只有换了一句话（不是前缀延长）
+                                // 才把旧译文丢掉。
+                                let old = line.text.trim();
+                                let new = sentence.text.trim();
+                                if !new.starts_with(old) {
+                                    line.translation.clear();
+                                }
                             }
                             line.text = sentence.text.clone();
                             line.done = sentence.final_;
@@ -652,10 +658,10 @@ fn run_live(
                 }
             }
         }
-        // 稳定 0.9 秒、且记录里的文本没有再增长，才真正送去翻译。
+        // 稳定 0.65 秒、且记录里的文本没有再增长，才真正送去翻译。
         if let Some((id, text, lang, first, last)) = pending_translation.clone() {
-            let quiet = last.elapsed() >= Duration::from_millis(900);
-            let too_long = first.elapsed() >= Duration::from_millis(3500);
+            let quiet = last.elapsed() >= Duration::from_millis(650);
+            let too_long = first.elapsed() >= Duration::from_millis(2800);
             if quiet || too_long {
                 let stable = shared
                     .lock()
