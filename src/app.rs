@@ -3237,7 +3237,7 @@ impl App {
                 };
                 let orig_rows = wrap(&original, 12.0, W::Semibold);
                 let orig: Vec<String> = orig_rows.iter().rev().take(2).rev().cloned().collect();
-                let mut y = 4.0f32;
+                let mut y = 17.0f32;
                 if orig.is_empty() {
                     c.text(x, 26.0, "正在听…", 12.0, W::Regular, theme::DIM, H::Left);
                 } else {

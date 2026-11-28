@@ -42,7 +42,7 @@ use windows::Win32::UI::Accessibility::{
     UIA_AutomationIdPropertyId, UIA_ProcessIdPropertyId, UIA_E_ELEMENTNOTAVAILABLE,
 };
 #[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::{
+use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity,
     GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SW_RESTORE, SW_SHOWNOACTIVATE, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
@@ -272,6 +272,17 @@ struct Worker {
     ready_sent: bool,
     last_error: String,
     next_launch: Instant,
+}
+
+#[cfg(windows)]
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // 停止识别后别把 LiveCaptions 留在后台；只结束我们自己拉起的实例。
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 #[cfg(windows)]
