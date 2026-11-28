@@ -474,25 +474,30 @@ fn run_live(
         let (tx, queue) = mpsc::channel::<(String, String, String)>();
         let tr_shared = shared.clone();
         worker = Some(std::thread::spawn(move || {
-            while let Ok(mut job) = queue.recv() {
-                while let Ok(next) = queue.try_recv() {
-                    job = next;
-                }
-                let (id, text, src) = job;
-                match translate_remote(backend, &url, &key, &model, &text, &src, &target) {
-                    Ok(translated) => {
-                        if !translated.trim().is_empty() {
-                            publish(&tr_shared, |view| {
-                                if let Some(line) = view.history.iter_mut().rev().find(|line| line.id == id)
-                                {
-                                    line.translation = translated;
-                                }
-                                view.translate_error.clear();
-                            });
+            // 每句单独起一个请求线程：云端一次约 2–3 秒，串行会让上一句
+            // 在下一句出现后还没翻完就被顶掉；并发后旧句的译文仍会补回来。
+            while let Ok((id, text, src)) = queue.recv() {
+                let tr_shared = tr_shared.clone();
+                let url = url.clone();
+                let key = key.clone();
+                let model = model.clone();
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    match translate_remote(backend, &url, &key, &model, &text, &src, &target) {
+                        Ok(translated) => {
+                            if !translated.trim().is_empty() {
+                                publish(&tr_shared, |view| {
+                                    if let Some(line) = view.history.iter_mut().rev().find(|line| line.id == id)
+                                    {
+                                        line.translation = translated;
+                                    }
+                                    view.translate_error.clear();
+                                });
+                            }
                         }
+                        Err(error) => publish(&tr_shared, |view| view.translate_error = error),
                     }
-                    Err(error) => publish(&tr_shared, |view| view.translate_error = error),
-                }
+                });
             }
         }));
         jobs = Some(tx);
